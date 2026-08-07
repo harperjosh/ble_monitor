@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    # The whole decode, identification and translation stack is verifiable
+    # without a radio, which is the point of the fixture-based tests.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install
+        run: uv pip install --system -e ".[dev]" scapy
+      - name: Lint
+        run: ruff check src/ tests/
+      - name: Test
+        run: pytest -q
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm --prefix web ci
+      - name: Type-check and build
+        run: npm --prefix web run build
+      - name: The committed bundle must match a fresh build
+        run: |
+          if ! git diff --quiet --stat -- src/blemon/web; then
+            echo "::error::src/blemon/web is out of date. Run 'npm --prefix web run build' and commit."
+            git diff --stat -- src/blemon/web
+            exit 1
+          fi

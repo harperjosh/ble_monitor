@@ -1,0 +1,48 @@
+# Headless always-on capture on a Raspberry Pi.
+#
+#   sudo cp deploy/ble-monitor.service /etc/systemd/system/
+#   sudo systemctl enable --now ble-monitor
+#   journalctl -u ble-monitor -f
+#
+# This binds to all interfaces so you can reach the dashboard from another
+# machine. Anyone on your network can then see everything it has captured —
+# drop --host if you only want it reachable from the Pi itself.
+#
+# Prefer capabilities over running as root:
+#   sudo setcap 'cap_net_raw,cap_net_admin+eip' "$(readlink -f "$(which python3)")"
+
+[Unit]
+Description=ble-monitor BLE environment capture service
+Documentation=https://github.com/harperjosh/ble_monitor
+After=network-online.target bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+ExecStart=/usr/local/bin/blemon serve --host 0.0.0.0 --http-port 8420 --name pi
+Restart=on-failure
+RestartSec=5
+
+# The raw HCI socket needs these. Granting them here is narrower than root.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Everything this process needs is its own state directory.
+StateDirectory=ble-monitor
+Environment=HOME=/var/lib/ble-monitor
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ble-monitor
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
