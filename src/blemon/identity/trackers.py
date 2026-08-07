@@ -75,9 +75,8 @@ def _duration_phrase(seconds: float) -> str:
     return f"{minutes / 60:.1f} hours"
 
 
-def evaluate(device: Device, sessions_seen: int = 1, now: float | None = None) -> list[Alert]:
+def evaluate(device: Device, sessions_seen: int = 1) -> list[Alert]:
     """Alerts this one device currently justifies. Empty is the normal answer."""
-    now = now or time.time()
     if device.is_mine:
         return []
 
@@ -190,12 +189,11 @@ def evaluate(device: Device, sessions_seen: int = 1, now: float | None = None) -
 def evaluate_all(
     devices: list[Device],
     session_counts: dict[str, int] | None = None,
-    now: float | None = None,
 ) -> list[Alert]:
     session_counts = session_counts or {}
     alerts: list[Alert] = []
     for d in devices:
-        alerts.extend(evaluate(d, sessions_seen=session_counts.get(d.key, 1), now=now))
+        alerts.extend(evaluate(d, sessions_seen=session_counts.get(d.key, 1)))
     order = {AlertLevel.ATTENTION: 0, AlertLevel.NOTABLE: 1, AlertLevel.INFO: 2}
     alerts.sort(key=lambda a: (order[a.level], -a.sessions_seen, -a.raised_at))
     return alerts

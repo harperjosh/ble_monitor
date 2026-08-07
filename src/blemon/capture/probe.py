@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from blemon.decode.assigned import characteristic_name, service_name
+from blemon.decode.assigned import characteristic_name, normalize_uuid, service_name
 from blemon.models import Confidence, Evidence, Guess
 
 PROBE_WARNING = (
@@ -183,7 +183,11 @@ async def probe(
                 }
                 for char in service.characteristics:
                     short = str(char.uuid).upper()
-                    short16 = short[4:8] if len(short) == 36 else short
+                    # Collapse to 16-bit only for genuine Bluetooth-base UUIDs;
+                    # a blind [4:8] slice would fold a vendor 128-bit UUID whose
+                    # chars happen to read "2A19" into the battery characteristic
+                    # and read/decode it as the wrong standard field.
+                    short16 = normalize_uuid(short)
                     citem: dict[str, Any] = {
                         "uuid": short,
                         "name": characteristic_name(short) or char.description,

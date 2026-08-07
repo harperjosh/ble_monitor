@@ -42,6 +42,36 @@ PHDR_CRC_CHECKED = 0x0400
 PHDR_CRC_VALID = 0x0800
 
 
+#: AD types whose value is a device's advertised local name — frequently a
+#: person's own name ("Sam's iPhone"). Blanked from raw payloads on redaction.
+_NAME_AD_TYPES = (0x08, 0x09)
+
+
+def redact_raw_payload(raw: bytes) -> bytes:
+    """Return the raw AD payload with any Local Name value blanked.
+
+    Redacting the address and name fields of a row while emitting the raw hex
+    verbatim would leak the name straight back out — the name is right there in
+    the bytes. This walks the AD structures and zeroes the name values, leaving
+    the rest of the payload (and its framing) intact for analysis.
+    """
+    if not raw:
+        return raw
+    out = bytearray(raw)
+    i = 0
+    n = len(out)
+    while i < n:
+        length = out[i]
+        if length == 0 or i + 1 + length > n:
+            break
+        type_code = out[i + 1]
+        if type_code in _NAME_AD_TYPES:
+            for j in range(i + 2, i + 1 + length):
+                out[j] = 0
+        i += 1 + length
+    return bytes(out)
+
+
 class Redactor:
     """Stable-within-a-file pseudonyms for addresses."""
 
@@ -147,7 +177,8 @@ def pcap_record(adv: Advertisement, redactor: Redactor | None = None) -> bytes:
     redactor = redactor or Redactor(enabled=False)
 
     addr_bytes = redactor.address_bytes(adv.address)
-    ll_payload = addr_bytes + adv.raw
+    raw = redact_raw_payload(adv.raw) if redactor.enabled else adv.raw
+    ll_payload = addr_bytes + raw
     pdu = _adv_pdu_header(adv, len(ll_payload)) + ll_payload
 
     flags = PHDR_DEWHITENED | PHDR_REF_AA_VALID
@@ -259,11 +290,19 @@ def _redact_snapshot(snap: dict[str, Any], redactor: Redactor) -> dict[str, Any]
     return snap
 
 
+def _raw_hex(raw: object, redact: bool) -> str:
+    if raw is None:
+        return ""
+    data = bytes(raw)
+    if redact:
+        data = redact_raw_payload(data)
+    return data.hex()
+
+
 def observations_to_json(rows: list[dict[str, Any]], redact: bool = False) -> str:
     redactor = Redactor(enabled=redact)
     out = []
     for r in rows:
-        raw = r.get("raw")
         out.append(
             {
                 "timestamp": r.get("ts"),
@@ -275,7 +314,7 @@ def observations_to_json(rows: list[dict[str, Any]], redact: bool = False) -> st
                 "phy": r.get("phy"),
                 "scan_response": bool(r.get("scan_rsp")),
                 "source": r.get("source"),
-                "raw": bytes(raw).hex() if raw is not None else "",
+                "raw": _raw_hex(r.get("raw"), redact),
             }
         )
     return json.dumps(
@@ -379,7 +418,6 @@ def observations_to_csv(rows: list[dict[str, Any]], redact: bool = False) -> str
     writer = csv.DictWriter(buf, fieldnames=OBSERVATION_CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for r in rows:
-        raw = r.get("raw")
         writer.writerow(
             {
                 "timestamp": r.get("ts"),
@@ -391,7 +429,7 @@ def observations_to_csv(rows: list[dict[str, Any]], redact: bool = False) -> str
                 "phy": r.get("phy"),
                 "scan_response": bool(r.get("scan_rsp")),
                 "source": r.get("source"),
-                "raw_hex": bytes(raw).hex() if raw is not None else "",
+                "raw_hex": _raw_hex(r.get("raw"), redact),
             }
         )
     return buf.getvalue()

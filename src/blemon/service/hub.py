@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +38,9 @@ DEFAULT_RETIRE_AFTER = 180.0
 FEED_LENGTH = 600
 #: How many link events to keep in memory.
 LINK_FEED_LENGTH = 400
+#: The 10s sweep enforces retention every this-many sweeps (~5 minutes). Deleting
+#: aged-out rows more often than that is pointless churn on an SD card.
+RETENTION_EVERY_SWEEPS = 30
 
 
 @dataclass
@@ -95,20 +98,42 @@ class Hub:
         self._tasks: list[asyncio.Task] = []
         self._stopping = False
         self._labels: dict[str, dict[str, Any]] = {}
-        self._on_event: list[Callable[[str, dict], None]] = []
+        #: address (current or any historical) -> cluster key, so the hot path
+        #: never has to scan every device to find who a rotated address belongs
+        #: to. Kept in step with device create, observe, merge and retire.
+        self._address_index: dict[str, str] = {}
+        #: Alert keys the user has dismissed. The sweep regenerates Alert objects
+        #: from scratch, so without this the acknowledged flag would be lost and
+        #: dismissed alerts would reappear within one sweep.
+        self._acknowledged: set[str] = set()
+        #: Guards structural changes to self.devices against the sync API
+        #: endpoints, which read it from Starlette's threadpool while the capture
+        #: task mutates it on the event loop.
+        self._lock = threading.RLock()
+        self._sweeps = 0
 
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
         if self.store is not None:
             self._labels = self.store.all_labels()
-            if self.persist:
-                self.session_id = self.store.start_session(
-                    self.session_name,
-                    backend=self.backend.name,
-                    capabilities=self.backend.capabilities.to_dict(),
-                )
+            # Seed the dismissed set from storage so acknowledgements survive a
+            # restart as well as each sweep.
+            with contextlib.suppress(Exception):
+                self._acknowledged = {
+                    a["key"] for a in self.store.alerts(include_acknowledged=True)
+                    if a.get("acknowledged")
+                }
+        # Start the radio before opening a session row. If the backend fails to
+        # start, this raises and no zombie session is left behind to become the
+        # bogus "most recent" capture for a later export.
         await self.backend.start()
+        if self.persist and self.store is not None:
+            self.session_id = self.store.start_session(
+                self.session_name,
+                backend=self.backend.name,
+                capabilities=self.backend.capabilities.to_dict(),
+            )
         self._tasks = [
             asyncio.create_task(self._ingest(), name="blemon-ingest"),
             asyncio.create_task(self._tick(), name="blemon-tick"),
@@ -117,17 +142,25 @@ class Hub:
 
     async def stop(self) -> None:
         self._stopping = True
-        await self.backend.stop()
+        with contextlib.suppress(Exception):
+            await self.backend.stop()
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
+            # A task may have already died with a non-cancel error; awaiting it
+            # re-raises, which must not abort the final flush below.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks.clear()
-        self._flush()
+        # Best-effort final persistence — never let a store error prevent the
+        # session from being closed cleanly.
+        with contextlib.suppress(Exception):
+            self._flush()
         if self.store is not None and self.session_id is not None:
-            self.store.snapshot_devices(self.session_id, list(self.devices.values()))
-            self.store.end_session(self.session_id)
+            with contextlib.suppress(Exception):
+                self.store.snapshot_devices(self.session_id, list(self.devices.values()))
+            with contextlib.suppress(Exception):
+                self.store.end_session(self.session_id)
 
     async def wait(self) -> None:
         if self._tasks:
@@ -155,20 +188,22 @@ class Hub:
                     queue.get_nowait()
                 with contextlib.suppress(asyncio.QueueFull):
                     queue.put_nowait(message)
-        for hook in self._on_event:
-            with contextlib.suppress(Exception):
-                hook(kind, message)
-
-    def on_event(self, hook: Callable[[str, dict], None]) -> None:
-        self._on_event.append(hook)
 
     # -- ingest ------------------------------------------------------------
 
     async def _ingest(self) -> None:
-        async for event in self.backend.stream():
-            if self._stopping:
-                return
-            self.ingest(event)
+        try:
+            async for event in self.backend.stream():
+                if self._stopping:
+                    return
+                self.ingest(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface, don't die silently
+            # A backend or store error must not kill capture invisibly with the
+            # socket still reporting "live". Tell every client what happened.
+            self.backend_status = BackendStatus("error", f"Capture stopped: {exc}")
+            self._broadcast("backend_status", {"status": self.backend_status.to_dict()})
 
     def ingest(self, event: Advertisement | LinkEvent | BackendStatus) -> None:
         """Feed one event in directly.
@@ -221,8 +256,12 @@ class Hub:
                 last_seen=adv.timestamp,
             )
             self._apply_label(device)
-            self.devices[key] = device
+            with self._lock:
+                self.devices[key] = device
+            self._address_index[adv.address] = key
             self.stats.devices_seen += 1
+        elif adv.address not in self._address_index:
+            self._address_index[adv.address] = key
         device.observe(parsed)
         self._dirty.add(key)
 
@@ -256,14 +295,20 @@ class Hub:
             self._pending_link_events.append((key, event))
 
     def _resolve_key(self, address: str | None) -> str:
-        """Map an address to its cluster key, following continuity merges."""
+        """Map an address to its cluster key, following continuity merges.
+
+        O(1) via a reverse index. After a MAC-rotation merge the device's
+        current address is no longer a key of its own, so a per-packet linear
+        scan over every device's ``addresses_seen`` would run on the hottest
+        path in exactly the dense, rotating-address rooms this tool targets.
+        """
         if address is None:
             return ""
         if address in self.devices:
             return address
-        for key, device in self.devices.items():
-            if address in device.addresses_seen:
-                return key
+        mapped = self._address_index.get(address)
+        if mapped is not None and mapped in self.devices:
+            return mapped
         return address
 
     def _apply_label(self, device: Device) -> None:
@@ -327,41 +372,98 @@ class Hub:
     async def _sweep(self) -> None:
         while not self._stopping:
             await asyncio.sleep(10.0)
-            self._flush()
-            self._correlate()
-            self._retire()
-            self._refresh_alerts()
-            if self.store is not None and self.session_id is not None:
-                self.store.snapshot_devices(self.session_id, list(self.devices.values()))
-            self.stats.dropped = getattr(self.backend, "dropped", 0)
-            self._broadcast("snapshot", self.snapshot())
+            try:
+                self._sweeps += 1
+                self._flush()
+                self._correlate()
+                self._retire()
+                self._refresh_alerts()
+                if self.store is not None and self.session_id is not None:
+                    self.store.snapshot_devices(self.session_id, list(self.devices.values()))
+                    # Enforce the documented retention window. Without this the
+                    # observations table grows at packet rate forever and the
+                    # "bounded by default" promise is dead code.
+                    if self._sweeps % RETENTION_EVERY_SWEEPS == 0:
+                        self.store.enforce_retention()
+                self.stats.dropped = getattr(self.backend, "dropped", 0)
+                self._broadcast("snapshot", self.snapshot())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — one bad sweep must not end capture
+                self._broadcast(
+                    "backend_status",
+                    {"status": BackendStatus("warning", f"sweep error: {exc}").to_dict()},
+                )
 
     def _correlate(self) -> None:
         links = find_links(list(self.devices.values()))
         if not links:
             return
         before = set(self.devices)
-        apply_links(self.devices, links)
+        with self._lock:
+            apply_links(self.devices, links)
         removed = before - set(self.devices)
         if removed:
             for key in removed:
                 self._dirty.discard(key)
+            # Survivors may have absorbed an address the user had labelled under
+            # a different key; rebuild the index and re-apply labels so the
+            # merge does not silently drop "this is mine" or a nickname.
+            self._rebuild_address_index()
+            for key in removed:
+                self._reapply_labels_for(key)
             self._broadcast("merged", {"removed": sorted(removed), "links": len(links)})
+
+    def _rebuild_address_index(self) -> None:
+        self._address_index = {
+            addr: key for key, device in self.devices.items() for addr in device.addresses_seen
+        }
+
+    def _reapply_labels_for(self, absorbed_key: str) -> None:
+        """After a merge, re-apply any label the user stored under an address
+        that now belongs to a surviving cluster."""
+        entry = self._labels.get(absorbed_key)
+        if not entry:
+            return
+        survivor_key = self._address_index.get(absorbed_key)
+        survivor = self.devices.get(survivor_key) if survivor_key else None
+        if survivor is None:
+            return
+        if entry.get("label") and not survivor.user_label:
+            survivor.user_label = entry.get("label")
+        survivor.is_mine = survivor.is_mine or bool(entry.get("is_mine"))
+        if entry.get("notes") and not survivor.notes:
+            survivor.notes = entry.get("notes")
+        survivor.identification = identify(survivor)
+        self._dirty.add(survivor.key)
 
     def _retire(self) -> None:
         cutoff = time.time() - self.retire_after
         gone = [k for k, d in self.devices.items() if d.last_seen < cutoff]
-        for key in gone:
-            self.devices.pop(key, None)
-            self._dirty.discard(key)
-        if gone:
-            self._broadcast("retired", {"keys": gone})
+        if not gone:
+            return
+        with self._lock:
+            for key in gone:
+                device = self.devices.pop(key, None)
+                self._dirty.discard(key)
+                if device is not None:
+                    for addr in device.addresses_seen:
+                        if self._address_index.get(addr) == key:
+                            self._address_index.pop(addr, None)
+        self._broadcast("retired", {"keys": gone})
 
     def _refresh_alerts(self) -> None:
         counts: dict[str, int] = {}
         if self.store is not None:
             counts = self.store.session_counts_for_devices(list(self.devices))
-        self.alerts = evaluate_all(list(self.devices.values()), session_counts=counts)
+        alerts = evaluate_all(list(self.devices.values()), session_counts=counts)
+        # evaluate_all builds fresh Alert objects (acknowledged defaults False),
+        # so re-apply the user's dismissals or a dismissed alert reappears every
+        # sweep.
+        for alert in alerts:
+            if alert.key in self._acknowledged:
+                alert.acknowledged = True
+        self.alerts = alerts
         if self.store is not None and self.session_id is not None and self.alerts:
             self.store.record_alerts(self.session_id, self.alerts)
         self._broadcast("alerts", {"alerts": [a.to_dict() for a in self.alerts]})
@@ -375,6 +477,10 @@ class Hub:
         is_mine: bool | None = None,
         notes: str | None = None,
     ) -> Device | None:
+        # Device keys are always upper-case addresses; canonicalize the incoming
+        # key so a label posted for "aa:bb:.." still matches the live "AA:BB:.."
+        # device (and the stored label row lines up with what _apply_label reads).
+        key = key.strip().upper()
         device = self.devices.get(key)
         if device is not None:
             if label is not None:
@@ -391,6 +497,7 @@ class Hub:
         return device
 
     def acknowledge_alert(self, alert_key: str) -> None:
+        self._acknowledged.add(alert_key)
         for alert in self.alerts:
             if alert.key == alert_key:
                 alert.acknowledged = True
@@ -400,7 +507,12 @@ class Hub:
     # -- views -------------------------------------------------------------
 
     def device_list(self) -> list[Device]:
-        return sorted(self.devices.values(), key=lambda d: -(d.smoothed_rssi or -127))
+        # Materialize under the lock: these reads run in Starlette's threadpool
+        # while the capture task inserts/retires on the event loop, and iterating
+        # a dict being resized raises "dictionary changed size during iteration".
+        with self._lock:
+            snapshot = list(self.devices.values())
+        return sorted(snapshot, key=lambda d: -(d.smoothed_rssi or -127))
 
     def snapshot(self, include_feed: bool = False) -> dict[str, Any]:
         devices = self.device_list()
@@ -419,22 +531,8 @@ class Hub:
         return payload
 
     def exposure_summary(self) -> dict[str, Any]:
-        devices = list(self.devices.values())
-        if not devices:
-            return {
-                "total": 0,
-                "bands": {},
-                "rotating": 0,
-                "stable": 0,
-                "named": 0,
-                "plaintext_content": 0,
-                "trackers": 0,
-                "median_score": 0,
-                "top_reasons": [],
-                "with_link_data": 0,
-                "encrypted_links": 0,
-                "plaintext_links": 0,
-            }
+        with self._lock:
+            devices = list(self.devices.values())
         scores = []
         bands: dict[str, int] = {}
         reasons: dict[str, int] = {}
@@ -453,7 +551,7 @@ class Hub:
             "named": sum(1 for d in devices if d.names),
             "plaintext_content": sum(1 for d in devices if "plaintext_content" in d.tags),
             "trackers": sum(1 for d in devices if d.is_tracker),
-            "median_score": scores[len(scores) // 2],
+            "median_score": scores[len(scores) // 2] if scores else 0,
             "top_reasons": sorted(reasons.items(), key=lambda kv: -kv[1])[:8],
             "with_link_data": sum(1 for d in devices if d.link_event_count),
             "encrypted_links": sum(1 for d in devices if d.encrypted_link_seen),

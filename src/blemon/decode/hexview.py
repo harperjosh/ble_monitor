@@ -80,22 +80,6 @@ def profile_bytes(payloads: list[bytes]) -> list[ByteProfile]:
     return out
 
 
-def hexdump(data: bytes, width: int = 16) -> list[dict[str, Any]]:
-    """Rows of ``{offset, hex, ascii}`` for a classic offset-annotated dump."""
-    rows = []
-    for i in range(0, len(data), width):
-        chunk = data[i : i + width]
-        rows.append(
-            {
-                "offset": i,
-                "hex": " ".join(f"{b:02x}" for b in chunk),
-                "ascii": "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk),
-                "bytes": list(chunk),
-            }
-        )
-    return rows
-
-
 def summarize_volatility(profiles: list[ByteProfile]) -> str:
     """One sentence of plain English about an unknown payload's shape."""
     if not profiles:

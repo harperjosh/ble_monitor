@@ -83,10 +83,21 @@ class Exposure:
             return "guarded"
         return "closed"
 
+    @property
+    def material(self) -> str:
+        """City-view building material. Glass = broadcasting readable identity
+        or content in the clear (chatty or wide open); opaque = shuttered.
+
+        Owned here so the city endpoint, the dashboard and the legend all read
+        one rule rather than each hardcoding the score cutoff.
+        """
+        return "glass" if self.band in ("chatty", "wide open") else "opaque"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "score": self.score,
             "band": self.band,
+            "material": self.material,
             "reasons": self.reasons,
             "protections": self.protections,
         }
@@ -141,6 +152,10 @@ class Device:
     last_parsed: ParsedAdvertisement | None = None
     identification: Identification | None = None
     user_label: str | None = None
+    #: Guesses read directly off the device by an active GATT probe. Stored on
+    #: the device (not spliced into ``identification``) so they survive the next
+    #: re-identify tick — the engine's gatt_probe matcher re-emits them.
+    probe_guesses: list[Any] = field(default_factory=list)
     #: Marked by the user as their own hardware; required for probe allowlist mode.
     is_mine: bool = False
     notes: str | None = None
@@ -237,6 +252,19 @@ class Device:
         self.sources |= other.sources
         self.rssi_history.extend(other.rssi_history)
         self.payload_window.extend(other.payload_window)
+        self.intervals.extend(other.intervals)
+        # Preserve the user's own annotations and any observed link state across
+        # a merge. Dropping is_mine here would resurrect tracker alerts for the
+        # user's own device and lock it out of the probe allowlist; dropping the
+        # link flags would corrupt the encrypted-vs-plaintext exposure stats.
+        self.is_mine = self.is_mine or other.is_mine
+        if not self.user_label and other.user_label:
+            self.user_label = other.user_label
+        if not self.notes and other.notes:
+            self.notes = other.notes
+        self.link_event_count += other.link_event_count
+        self.encrypted_link_seen = self.encrypted_link_seen or other.encrypted_link_seen
+        self.plaintext_link_seen = self.plaintext_link_seen or other.plaintext_link_seen
         self.continuity_confidence = min(self.continuity_confidence, confidence)
         for e in evidence:
             if e not in self.continuity_evidence:

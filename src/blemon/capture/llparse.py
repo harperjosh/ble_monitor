@@ -155,7 +155,9 @@ def _parse_extended(payload: bytes, tx_random: bool, rx_random: bool) -> AdvPdu:
     if "aux_ptr" in fields:
         raw = fields["aux_ptr"]
         aux_channel = raw[0] & 0x3F
-        aux_phy = AUX_PHY_NAMES.get((raw[2] >> 1) & 0x07)
+        # Core Spec Vol 6 Part B 2.3.4.5: the Aux PHY is bits 21-23, i.e. the top
+        # three bits of the third octet. Bits 1-3 belong to the 13-bit AUX Offset.
+        aux_phy = AUX_PHY_NAMES.get((raw[2] >> 5) & 0x07)
 
     return AdvPdu(
         pdu_type=PduType.ADV_EXT_IND,

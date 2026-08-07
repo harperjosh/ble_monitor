@@ -89,8 +89,13 @@ class CaptureBackend(abc.ABC):
 
     # -- optional ----------------------------------------------------------
 
-    async def follow(self, address: str) -> bool:
-        """Aim connection-following at one device. False if unsupported."""
+    async def follow(self, address: str, address_type: str | None = None) -> bool:
+        """Aim connection-following at one device. False if unsupported.
+
+        ``address_type`` is the device's known address type ("public"/"random"/…)
+        when the caller has it; some sniffers need it to build the correct
+        connection-follow filter. None means "not known".
+        """
         return False
 
     async def unfollow(self) -> None:
@@ -227,6 +232,10 @@ class QueueBackend(CaptureBackend):
             pass
 
     async def stream(self) -> AsyncIterator[Event]:
+        # Emit the post-start status first so the UI shows what the backend is
+        # doing immediately. Every QueueBackend subclass wants this, so it lives
+        # here rather than being copy-pasted into each one's stream() override.
+        yield self._status
         while self.running:
             event = await self._queue.get()
             if event is None:

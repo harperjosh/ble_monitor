@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from blemon import __version__
 from blemon.capture.probe import PROBE_WARNING, is_allowed, probe
@@ -219,14 +220,17 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
                     # Deterministic lot: the same device lands in the same place
                     # every session, so a place has a recognisable skyline.
                     "lot": d.stable_hash(),
-                    "height": round(min(1.0, d.advertising_rate / max_rate), 4),
-                    "footprint": round(min(1.0, d.duration / max_duration), 4),
+                    # sqrt so a moderately chatty device is still a visible tower
+                    # rather than a stub — matches the dashboard's own scaling.
+                    "height": round(min(1.0, (d.advertising_rate / max_rate) ** 0.5), 4),
+                    "footprint": round(0.42 + 0.5 * min(1.0, d.duration / max_duration), 4),
                     "proximity": d.proximity.value,
                     "rssi": d.smoothed_rssi,
                     "lit": time.time() - d.last_seen < 5.0,
                     "last_seen": d.last_seen,
-                    # Glass = broadcasting in the clear, opaque = shuttered.
-                    "material": "glass" if d.exposure().score >= 45 else "opaque",
+                    # Glass = broadcasting in the clear, opaque = shuttered. The
+                    # rule lives on Exposure so this and the dashboard agree.
+                    "material": d.exposure().material,
                     "exposure": d.exposure().score,
                     "is_tracker": d.is_tracker,
                     "rotating": d.rotates_address,
@@ -251,7 +255,7 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
     # -- supporting views --------------------------------------------------
 
     @app.get("/api/feed")
-    def feed(limit: int = Query(200, le=600)) -> dict[str, Any]:
+    def feed(limit: int = Query(200, ge=1, le=600)) -> dict[str, Any]:
         return {"packets": list(hub.feed)[-limit:], "link_events": list(hub.link_feed)[-limit:]}
 
     @app.get("/api/timeline")
@@ -297,7 +301,8 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
                 "This capture backend cannot follow connections. That needs sniffer "
                 "hardware — see the capability panel.",
             )
-        ok = await hub.backend.follow(address)
+        address_type = device.address_type.value if device else None
+        ok = await hub.backend.follow(address, address_type=address_type)
         return {
             "ok": ok,
             "address": address,
@@ -334,13 +339,13 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
         if device is not None and result.success:
             from blemon.identity import identify
 
+            # Store the probe findings on the device and re-identify through the
+            # engine. Doing it this way (rather than splicing into
+            # identification here) means the probe result survives the next
+            # per-packet re-identify tick instead of being overwritten within a
+            # second.
+            device.probe_guesses = result.to_guesses()
             device.identification = identify(device)
-            extra = result.to_guesses()
-            if extra and device.identification:
-                best = device.identification.best
-                if best:
-                    device.identification.runners_up.insert(0, best)
-                device.identification.best = extra[0]
         return result.to_dict()
 
     @app.get("/api/probe/policy")
@@ -375,8 +380,11 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
         body = {}
         with contextlib.suppress(Exception):
             body = await request.json()
-        hub.store.purge(keep_labels=body.get("keep_labels", True))
-        return {"ok": True, "stored": hub.store.what_is_stored()}
+        # purge() runs a full DELETE + VACUUM; run it off the event loop so it
+        # does not freeze capture and every websocket for the rewrite's duration.
+        await run_in_threadpool(hub.store.purge, keep_labels=body.get("keep_labels", True))
+        stored = await run_in_threadpool(hub.store.what_is_stored)
+        return {"ok": True, "stored": stored}
 
     @app.get("/api/export/devices.json")
     def export_devices_json(redact: bool = False) -> Response:
@@ -443,15 +451,23 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
         def index() -> HTMLResponse:
             return HTMLResponse((assets / "index.html").read_text(encoding="utf-8"))
 
+        assets_root = assets.resolve()
+
         @app.get("/{path:path}", response_class=HTMLResponse)
         def spa(path: str) -> HTMLResponse:
             # Single-page app: unknown paths render the shell, not a 404.
             if path.startswith("api/"):
                 return JSONResponse({"detail": "Not found"}, status_code=404)
-            candidate = assets / path
-            if path and candidate.is_file():
-                return HTMLResponse(candidate.read_text(encoding="utf-8"))
-            return HTMLResponse((assets / "index.html").read_text(encoding="utf-8"))
+            # Serve a real bundled file only if it resolves to somewhere *inside*
+            # the web asset directory. Without this containment check, a path
+            # like "../../../../etc/passwd" escapes the bundle and turns the
+            # catch-all into remote arbitrary-file read — remotely reachable
+            # under the shipped `--host 0.0.0.0` deployment.
+            if path:
+                candidate = (assets_root / path).resolve()
+                if candidate.is_relative_to(assets_root) and candidate.is_file():
+                    return HTMLResponse(candidate.read_text(encoding="utf-8"))
+            return HTMLResponse((assets_root / "index.html").read_text(encoding="utf-8"))
     else:
 
         @app.get("/", response_class=HTMLResponse)

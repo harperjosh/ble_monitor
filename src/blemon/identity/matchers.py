@@ -128,7 +128,7 @@ NAME_RULES: list[tuple[str, str, Category, Confidence, str | None]] = [
     (r"\baranet\b", "Aranet CO2 sensor", Category.SENSOR, Confidence.HIGH, "Aranet"),
     (r"\bswitchbot\b", "SwitchBot device", Category.APPLIANCE, Confidence.HIGH, "SwitchBot"),
     (r"\bhue\b", "Philips Hue light", Category.APPLIANCE, Confidence.MEDIUM, "Signify"),
-    (r"\blywsd|mhо?-c\d|mi\s*(band|scale)\b", "Xiaomi sensor", Category.SENSOR, Confidence.HIGH, "Xiaomi"),
+    (r"\blywsd|mho-?c\d|mi\s*(band|scale)\b", "Xiaomi sensor", Category.SENSOR, Confidence.HIGH, "Xiaomi"),
     (r"\bthinkpad|latitude|elitebook\b", "Business laptop", Category.COMPUTER, Confidence.MEDIUM, None),
     (r"\bprinter|officejet|laserjet\b", "Printer", Category.APPLIANCE, Confidence.HIGH, None),
     (r"\btv\b|\bsmart\s*tv\b|\bbravia\b|\bviera\b", "Television", Category.APPLIANCE, Confidence.MEDIUM, None),
@@ -575,6 +575,19 @@ def by_behaviour(device: Device) -> Iterable[Guess]:
 # ---------------------------------------------------------------------------
 # 7. Apple model inference from proximity-pairing model IDs, as a runner-up
 # ---------------------------------------------------------------------------
+
+
+@matcher("gatt_probe")
+def by_probe(device: Device) -> Iterable[Guess]:
+    """Re-emit guesses read directly off the device by an active GATT probe.
+
+    A probe reads the model and manufacturer from the device itself, so these
+    are the highest-confidence guesses in the system. Routing them through the
+    engine (rather than splicing them into ``identification`` at the HTTP layer)
+    means the next re-identify tick keeps them ranked first instead of silently
+    discarding them.
+    """
+    return list(getattr(device, "probe_guesses", []) or [])
 
 
 @matcher("apple_model_table")

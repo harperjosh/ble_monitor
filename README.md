@@ -124,8 +124,9 @@ Bluetooth.
 ### Raspberry Pi (the recommended place to run it)
 
 ```bash
-sudo apt install -y python3-pip
-uv tool install ble-monitor
+# Install uv (Raspberry Pi OS does not ship it), then install ble-monitor:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install ble-monitor      # or: python3 -m pip install --user ble-monitor
 
 # Grant the radio capabilities rather than running everything as root:
 sudo setcap 'cap_net_raw,cap_net_admin+eip' "$(readlink -f "$(which python3)")"
@@ -141,9 +142,13 @@ has captured.
 
 #### Headless, always-on
 
-A systemd unit is provided in [`deploy/ble-monitor.service`](deploy/ble-monitor.service):
+A systemd unit is provided in [`deploy/ble-monitor.service`](deploy/ble-monitor.service).
+It runs from a system-wide virtualenv (a user's `~/.local/bin` is unreachable
+under the unit's `ProtectHome=yes` hardening):
 
 ```bash
+sudo python3 -m venv /opt/ble-monitor
+sudo /opt/ble-monitor/bin/pip install ble-monitor
 sudo cp deploy/ble-monitor.service /etc/systemd/system/
 sudo systemctl enable --now ble-monitor
 journalctl -u ble-monitor -f
@@ -176,7 +181,9 @@ Once a sniffer is attached, pick any device in any view and aim the spotlight at
 it (right-click in the city, or the button in its detail panel, or
 `blemon follow <address>`). **One sniffer follows one connection at a time** —
 advertising capture is broad and continuous, connection following is a
-spotlight you aim. Attach a second sniffer to aim a second one.
+spotlight you aim. A capture service currently drives a single sniffer;
+following two connections in parallel from two attached sniffers is planned but
+not yet implemented.
 
 ---
 

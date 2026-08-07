@@ -33,9 +33,8 @@ import socket
 import struct
 import threading
 import time
-from collections.abc import AsyncIterator
 
-from blemon.capture.base import BackendStatus, CaptureError, Event, QueueBackend, register
+from blemon.capture.base import BackendStatus, CaptureError, QueueBackend, register
 from blemon.models import Advertisement, Capabilities, PduType, classify_address
 
 AF_BLUETOOTH = 31
@@ -581,10 +580,6 @@ class HciBackend(QueueBackend):
             )
         return out
 
-    async def stream(self) -> AsyncIterator[Event]:
-        yield self._status
-        async for event in super().stream():
-            yield event
 
 
 register("hci", HciBackend, priority=30)

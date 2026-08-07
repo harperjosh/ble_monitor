@@ -33,7 +33,7 @@ export function Inventory({
     let list = devices.filter((d) => {
       if (only === "trackers" && !d.is_tracker) return false;
       if (only === "rotating" && !d.address_is_rotating) return false;
-      if (only === "open" && d.exposure.score < 45) return false;
+      if (only === "open" && d.exposure.band !== "wide open") return false;
       if (only === "mine" && !d.is_mine) return false;
       if (!needle) return true;
       return `${d.display_name} ${d.address} ${d.names.join(" ")} ${d.service_uuids.join(" ")} ${d.company_names.join(" ")} ${Object.keys(d.protocols).join(" ")}`

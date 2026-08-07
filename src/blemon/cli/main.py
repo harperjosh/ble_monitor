@@ -149,9 +149,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_purge.add_argument("--yes", action="store_true")
     p_purge.add_argument("--labels", action="store_true", help="also delete your own labels")
 
-    sub.add_parser("stored", help="show exactly what is stored on this machine").add_argument(
-        "--db"
-    )
+    p_stored = sub.add_parser("stored", help="show exactly what is stored on this machine")
+    p_stored.add_argument("--db")
+    p_stored.add_argument("--json", action="store_true", help="always JSON; accepted for parity")
     return parser
 
 
@@ -222,7 +222,14 @@ async def cmd_scan(args: argparse.Namespace, console: Console) -> int:
         queue = hub.subscribe()
         try:
             while deadline is None or time.time() < deadline:
-                message = await queue.get()
+                # Wait with a timeout so --seconds is honoured even when the
+                # radio is silent; a bare queue.get() would block forever in a
+                # quiet RF environment and never re-check the deadline.
+                timeout = None if deadline is None else max(0.0, deadline - time.time())
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    break
                 if message["type"] in ("packet", "devices", "alerts"):
                     sys.stdout.write(json.dumps(message, default=str) + "\n")
                     sys.stdout.flush()
@@ -287,14 +294,21 @@ async def cmd_watch(args: argparse.Namespace, console: Console) -> int:
     console.print(f"[grey62]Watching for [bold]{args.address}[/bold] — "
                   f"matching on address or name. Ctrl-C to stop.[/]\n")
     seen = 0
+    # Track how many packets we have already printed per device locally rather
+    # than nulling device.last_parsed — that field is load-bearing for the
+    # identity matchers and the continuity fingerprint, so mutating it here
+    # would corrupt identification and MAC-rotation linking for the watched
+    # device while the command runs.
+    printed: dict[str, int] = {}
     try:
         while deadline is None or time.time() < deadline:
             await asyncio.sleep(0.2)
             for device in hub.device_list():
                 if needle not in device.address.upper() and needle not in device.display_name.upper():
                     continue
-                if device.last_parsed is None:
+                if device.last_parsed is None or device.packet_count <= printed.get(device.key, 0):
                     continue
+                printed[device.key] = device.packet_count
                 parsed = device.last_parsed.to_dict()
                 if args.json:
                     sys.stdout.write(json.dumps(parsed, default=str) + "\n")
@@ -303,7 +317,6 @@ async def cmd_watch(args: argparse.Namespace, console: Console) -> int:
                     console.print(render.decode_tree(parsed))
                     console.rule(style="grey23")
                 seen += 1
-                device.last_parsed = None  # only print each new packet once
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:

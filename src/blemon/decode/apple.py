@@ -457,6 +457,13 @@ def _find_my(value: bytes, offset: int, context: dict[str, Any]) -> Decoding:
             "It is in its short 'owner is nearby' form, which means the device it belongs to "
             "is very likely in the room with it."
         )
+    tags = ["apple", "find_my", "tracker", "rotating_identity"]
+    if kind == "separated":
+        # This is the frame an AirTag emits once it has been away from its owner
+        # — the exact signal the unwanted-tracking alert keys off. Without this
+        # tag the flagship anti-stalking alert never fires for the most common
+        # tracker there is.
+        tags.append("separated_tracker")
     return Decoding(
         protocol="apple_find_my",
         summary=f"Find My ({kind}), battery {battery}, maintained={maintained}",
@@ -466,7 +473,7 @@ def _find_my(value: bytes, offset: int, context: dict[str, Any]) -> Decoding:
             f"device, or a Find My Network accessory. Reported battery: {battery}. {detail}"
         ),
         category=Category.TRACKER,
-        tags=["apple", "find_my", "tracker", "rotating_identity"],
+        tags=tags,
     )
 
 

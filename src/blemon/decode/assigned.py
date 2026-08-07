@@ -74,13 +74,19 @@ WELL_KNOWN_UUID16: dict[str, str] = {
 
 
 def normalize_uuid(uuid: str) -> str:
-    """Upper-case a UUID and collapse the Bluetooth base range to 16/32 bits."""
+    """Upper-case a UUID and collapse the Bluetooth base range to 16/32 bits.
+
+    Both forms of the base range collapse: the full 128-bit dashed form and the
+    bare 8-hex 32-bit form. The latter is what the 32-bit Service Data AD type
+    (0x20) produces — e.g. "0000FEAA" — and it has to fold to "FEAA" so it
+    matches decoders and names registered under the 16-bit key.
+    """
     u = uuid.upper().strip()
     if len(u) == 36 and u.endswith(BLUETOOTH_BASE_SUFFIX):
         head = u[:8]
-        if head.startswith("0000"):
-            return head[4:]
-        return head
+        return head[4:] if head.startswith("0000") else head
+    if len(u) == 8 and u.startswith("0000"):
+        return u[4:]
     return u
 
 

@@ -26,13 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import struct
 import threading
 import time
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from blemon.capture.base import BackendStatus, CaptureError, Event, QueueBackend, register
+from blemon.capture.base import BackendStatus, CaptureError, QueueBackend, register
 from blemon.capture.llparse import parse_adv_pdu
 from blemon.decode.link import decode_data_pdu
 from blemon.models import Advertisement, Capabilities, LinkEvent, PduType, classify_address
@@ -132,6 +132,46 @@ def detect_sniffers() -> list[DetectedSniffer]:
             )
         )
     return found
+
+
+def probe_firmware(port: str, baudrate: int = 2_000_000, timeout: float = 0.4) -> str | None:
+    """Best-effort: ask a detected dongle for its Sniffle firmware version.
+
+    A device with the right USB identity is not necessarily running Sniffle — a
+    factory SONOFF dongle ships with Zigbee firmware and answers nothing. This
+    opens the port briefly, sends the version command, and returns the version
+    string if it replies, or None if it stays silent. Always closes the port.
+    """
+    try:
+        import serial
+    except ImportError:
+        return None
+    ser = None
+    try:
+        ser = serial.Serial(port, baudrate, timeout=timeout)
+        body = bytes([CMD_VERSION])
+        frame = base64.b64encode(bytes([(len(body) + 3) // 3]) + body) + b"\r\n"
+        ser.write(frame)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = ser.readline()
+            if not line:
+                continue
+            try:
+                data = base64.b64decode(line.rstrip())
+            except Exception:
+                continue
+            # A measurement message (type 0x14) carrying a version measurement
+            # (subtype 0x00) is the version reply.
+            if len(data) >= 3 and data[1] == MSG_MEASUREMENT and data[2] == 0x00:
+                return data[3:].decode("utf-8", errors="replace").strip("\x00").strip() or "present"
+        return None
+    except Exception:
+        return None
+    finally:
+        if ser is not None:
+            with contextlib.suppress(Exception):
+                ser.close()
 
 
 class SniffleTransport:
@@ -361,7 +401,10 @@ class SniffleBackend(QueueBackend):
 
     # -- following ---------------------------------------------------------
 
-    async def follow(self, address: str) -> bool:
+    async def follow(self, address: str, address_type: str | None = None) -> bool:
+        # Sniffle filters connection-follow on the 6 MAC bytes alone, so the
+        # address type is accepted for interface parity but not needed here.
+        del address_type
         if self._transport is None:
             return False
         try:
@@ -536,10 +579,6 @@ class SniffleBackend(QueueBackend):
             ),
         )
 
-    async def stream(self) -> AsyncIterator[Event]:
-        yield self._status
-        async for event in super().stream():
-            yield event
 
 
 register("sniffle", SniffleBackend, priority=10)

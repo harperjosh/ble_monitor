@@ -30,6 +30,7 @@ export interface Identification {
 export interface Exposure {
   score: number;
   band: "wide open" | "chatty" | "guarded" | "closed";
+  material: "glass" | "opaque";
   reasons: string[];
   protections: string[];
 }

@@ -141,7 +141,7 @@ export function City({
         height: Math.min(1, Math.sqrt(d.advertising_rate / maxRate)),
         footprint: 0.42 + 0.5 * Math.min(1, d.duration / maxDuration),
         color: CATEGORY_COLOR[d.category] ?? CATEGORY_COLOR.unknown,
-        glass: d.exposure.score >= 45,
+        glass: d.exposure.material === "glass",
         lit: now - d.last_seen < 5,
         screenX: 0,
         screenY: 0,
@@ -438,7 +438,7 @@ export function City({
             {Math.round(hover.device.duration)}s here
           </div>
           <div className={`tiny band-${hover.device.exposure.band.replace(" ", "-")}`}>
-            {hover.device.exposure.score >= 45
+            {hover.device.exposure.material === "glass"
               ? "glass — broadcasting in the clear"
               : "shuttered — rotating and saying little"}
           </div>

@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id, ts);
 CREATE INDEX IF NOT EXISTS idx_obs_device  ON observations(device_key, ts);
+-- Retention deletes by timestamp across all sessions; without a ts-leading
+-- index that DELETE would full-scan the whole table.
+CREATE INDEX IF NOT EXISTS idx_obs_ts      ON observations(ts);
 
 CREATE TABLE IF NOT EXISTS link_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -218,10 +221,22 @@ class Store:
         return out
 
     def session(self, session_id: int) -> dict[str, Any] | None:
-        for s in self.sessions(limit=10_000):
-            if s["id"] == session_id:
-                return s
-        return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT s.*,
+                       (SELECT COUNT(*) FROM devices d WHERE d.session_id = s.id)      AS device_count,
+                       (SELECT COUNT(*) FROM observations o WHERE o.session_id = s.id) AS observation_count
+                FROM sessions s WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["capabilities"] = json.loads(d.get("capabilities") or "{}")
+        d["duration"] = (d.get("ended_at") or time.time()) - d["started_at"]
+        return d
 
     def delete_session(self, session_id: int) -> None:
         with self._lock:
@@ -429,8 +444,14 @@ class Store:
         if tracker_only:
             sql.append("AND is_tracker=1")
         if search:
-            sql.append("AND (label LIKE ? OR address LIKE ? OR key LIKE ?)")
-            args += [f"%{search}%"] * 3
+            # Escape LIKE wildcards so a search for "100%" or "A_" is a literal
+            # match rather than a pattern that silently matches far too much.
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql.append(
+                "AND (label LIKE ? ESCAPE '\\' OR address LIKE ? ESCAPE '\\' "
+                "OR key LIKE ? ESCAPE '\\')"
+            )
+            args += [f"%{escaped}%"] * 3
         sql.append("ORDER BY last_seen DESC LIMIT ?")
         args.append(limit)
         with self._lock:
@@ -500,17 +521,25 @@ class Store:
         return [dict(r) for r in rows]
 
     def replay(self, session_id: int, batch: int = 2000):
-        """Yield advertisements from a recorded session in timestamp order."""
-        offset = 0
+        """Yield advertisements from a recorded session in insertion order.
+
+        Keyset pagination on the integer primary key rather than LIMIT/OFFSET:
+        OFFSET re-walks the index from row zero for every batch, which is
+        quadratic over a multi-million-row session and stalls both live replay
+        and PCAP export. ``id`` is autoincrement, so within one session it is
+        already in capture order.
+        """
+        after = 0
         while True:
             with self._lock:
                 rows = self._conn.execute(
-                    """SELECT * FROM observations WHERE session_id=?
-                       ORDER BY ts ASC LIMIT ? OFFSET ?""",
-                    (session_id, batch, offset),
+                    """SELECT * FROM observations WHERE session_id=? AND id>?
+                       ORDER BY id ASC LIMIT ?""",
+                    (session_id, after, batch),
                 ).fetchall()
             if not rows:
                 return
+            after = rows[-1]["id"]
             for r in rows:
                 yield r["device_key"], Advertisement(
                     address=r["address"],
@@ -528,7 +557,6 @@ class Store:
                     scan_response=bool(r["scan_rsp"]),
                     source=r["source"] or "replay",
                 )
-            offset += batch
 
     def link_events(self, session_id: int, device_key: str | None = None, limit: int = 2000):
         sql = ["SELECT * FROM link_events WHERE session_id=?"]
@@ -545,6 +573,10 @@ class Store:
             d = dict(r)
             d["detail"] = json.loads(d["detail"] or "{}")
             d["raw"] = bytes(d["raw"] or b"").hex()
+            # The live WebSocket feed emits link events keyed "timestamp"; keep
+            # the stored-read path the same shape so the web client (which reads
+            # e.timestamp) does not render "Invalid Date" for replayed captures.
+            d["timestamp"] = d.pop("ts", None)
             out.append(d)
         return out
 
@@ -584,7 +616,16 @@ class Store:
                     "SELECT COUNT(DISTINCT address) AS n FROM observations"
                 ).fetchone()["n"]
             )
-        size = self.path.stat().st_size if self.path.exists() and str(self.path) != ":memory:" else 0
+        # Count the WAL and shared-memory side files too. In WAL mode recent
+        # writes live in capture.db-wal until checkpoint, so reporting only the
+        # main file understates real on-disk usage right after a busy capture —
+        # exactly when a user checks the transparency view.
+        size = 0
+        if str(self.path) != ":memory:":
+            for suffix in ("", "-wal", "-shm"):
+                side = self.path.with_name(self.path.name + suffix)
+                if side.exists():
+                    size += side.stat().st_size
         return {
             "database_path": str(self.path),
             "size_bytes": size,

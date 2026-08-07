@@ -21,7 +21,7 @@ class ReplayBackend(CaptureBackend):
 
     def __init__(
         self,
-        session_id: int,
+        session_id: int | None = None,
         store: Store | None = None,
         speed: float = 1.0,
         loop: bool = False,
@@ -29,6 +29,14 @@ class ReplayBackend(CaptureBackend):
         **_: object,
     ) -> None:
         super().__init__()
+        # Keyword-optional with an explicit CaptureError, so `blemon scan
+        # --backend replay` (no --session-id) gives the friendly remedy every
+        # other backend produces rather than a raw TypeError the CLI won't catch.
+        if session_id is None:
+            raise CaptureError(
+                "Replay needs a session to play back.",
+                remedy="Pass --session-id N. Run `blemon sessions` to list them.",
+            )
         self.store = store or Store(db_path)
         self.session_id = int(session_id)
         self.speed = max(0.05, float(speed))

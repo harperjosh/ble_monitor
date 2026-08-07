@@ -168,8 +168,9 @@ def describe_room(devices: list[Device]) -> str:
     trackers = sum(1 for d in devices if d.is_tracker)
     rotating = sum(1 for d in devices if d.rotates_address)
     named = sum(1 for d in devices if d.names)
-    exposures = [d.exposure().score for d in devices]
-    wide_open = sum(1 for s in exposures if s >= 70)
+    # Count via the band classification that Exposure owns, so this sentence and
+    # the exposure dashboard's "wide open" tally never drift apart.
+    wide_open = sum(1 for d in devices if d.exposure().band == "wide open")
 
     bits = [f"{total} device{'s' if total != 1 else ''} in range."]
     bits.append(

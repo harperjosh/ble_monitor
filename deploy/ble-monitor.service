@@ -1,5 +1,9 @@
 # Headless always-on capture on a Raspberry Pi.
 #
+# Install into a system location the service can actually reach (a user's
+# ~/.local/bin is blocked by ProtectHome=yes below):
+#   sudo python3 -m venv /opt/ble-monitor
+#   sudo /opt/ble-monitor/bin/pip install ble-monitor
 #   sudo cp deploy/ble-monitor.service /etc/systemd/system/
 #   sudo systemctl enable --now ble-monitor
 #   journalctl -u ble-monitor -f
@@ -8,8 +12,8 @@
 # machine. Anyone on your network can then see everything it has captured —
 # drop --host if you only want it reachable from the Pi itself.
 #
-# Prefer capabilities over running as root:
-#   sudo setcap 'cap_net_raw,cap_net_admin+eip' "$(readlink -f "$(which python3)")"
+# The service is granted cap_net_raw/cap_net_admin below, so the raw HCI socket
+# works without running as root.
 
 [Unit]
 Description=ble-monitor BLE environment capture service
@@ -21,7 +25,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 Group=pi
-ExecStart=/usr/local/bin/blemon serve --host 0.0.0.0 --http-port 8420 --name pi
+ExecStart=/opt/ble-monitor/bin/blemon serve --host 0.0.0.0 --http-port 8420 --name pi
 Restart=on-failure
 RestartSec=5
 

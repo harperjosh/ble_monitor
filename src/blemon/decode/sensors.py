@@ -115,23 +115,31 @@ def decode_thermometer(data: bytes, context: dict[str, Any]) -> list[Decoding]:
 
 @service_data_decoder("181A", name="environmental_sensing")
 def decode_environmental(data: bytes, context: dict[str, Any]) -> list[Decoding]:
-    #: The common convention for putting ESS in an advertisement is
-    #: MAC(6) + temperature(int16, 0.01C) + humidity(uint16, 0.01%) + battery.
+    # The dominant way a sensor puts environmental data on 0x181A in the wild is
+    # the pvvx/ATC "custom" layout (Xiaomi LYWSD03MMC and clones reflashed with
+    # pvvx firmware):
+    #   MAC[6] little-endian, temperature int16 LE x0.01C, humidity uint16 LE
+    #   x0.01%, battery_mv uint16 LE, battery_level uint8, counter, flags.
+    # The MAC is stored low byte first, so it is reversed for display; battery
+    # percent lives at byte 12, not byte 10 (10-11 are millivolts).
     fields: list[Field_] = []
     parts: list[str] = []
     if len(data) >= 10:
-        addr = ":".join(f"{b:02X}" for b in data[:6])
+        addr = ":".join(f"{b:02X}" for b in data[5::-1])
         temp = struct.unpack("<h", data[6:8])[0] / 100.0
         hum = struct.unpack("<H", data[8:10])[0] / 100.0
         fields += [
-            Field_("device_address", addr, 0, 6, "echoed inside the payload"),
+            Field_("device_address", addr, 0, 6, "echoed inside the payload (little-endian)"),
             Field_("temperature_c", round(temp, 2), 6, 2),
             Field_("humidity_percent", round(hum, 2), 8, 2),
         ]
         parts += [f"{temp:.1f} °C", f"{hum:.0f}% humidity"]
-        if len(data) >= 11:
-            fields.append(Field_("battery_percent", data[10], 10, 1))
-            parts.append(f"{data[10]}% battery")
+        if len(data) >= 12:
+            mv = struct.unpack("<H", data[10:12])[0]
+            fields.append(Field_("battery_mv", mv, 10, 2))
+        if len(data) >= 13:
+            fields.append(Field_("battery_percent", data[12], 12, 1))
+            parts.append(f"{data[12]}% battery")
     else:
         fields.append(Field_("payload", data.hex(), 0, len(data)))
     return [
@@ -564,10 +572,13 @@ def decode_govee(data: bytes, context: dict[str, Any]) -> list[Decoding]:
     packed = int.from_bytes(data[1:4], "big")
     negative = bool(packed & 0x800000)
     packed &= 0x7FFFFF
-    # Temperature and humidity share one 24-bit integer, so the sub-0.1-degree
-    # digits are an artefact of the humidity value rather than a measurement.
-    # These sensors resolve to 0.1, and that is what we report.
-    temp_c = round((packed / 10000.0) * (-1 if negative else 1), 1)
+    # Temperature and humidity share one 24-bit integer: value = temp*10000 +
+    # hum*10. Temperature must be recovered as (value // 1000) / 10, NOT
+    # value / 10000 — dividing by 10000 folds the humidity digits into the
+    # temperature and reports it up to 0.1 degree too high whenever humidity is
+    # 50% or more (e.g. 21.0C/60% packs to 210600, and 210600/10000 rounds to
+    # 21.1). Integer-dividing away the humidity digits first is exact.
+    temp_c = round((packed // 1000) / 10.0 * (-1 if negative else 1), 1)
     humidity = round((packed % 1000) / 10.0, 1)
     battery = data[4]
     return [

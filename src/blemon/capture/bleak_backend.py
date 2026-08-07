@@ -30,9 +30,8 @@ import asyncio
 import platform
 import struct
 import time
-from collections.abc import AsyncIterator
 
-from blemon.capture.base import BackendStatus, CaptureError, Event, QueueBackend, register
+from blemon.capture.base import BackendStatus, CaptureError, QueueBackend, register
 from blemon.models import AddressType, Advertisement, Capabilities, PduType, classify_address
 
 
@@ -103,6 +102,10 @@ class BleakBackend(QueueBackend):
         self._scanner = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._is_macos = platform.system() == "Darwin"
+        #: Resolved in start(). We try passive first so the default posture is
+        #: genuinely receive-only; only if the platform refuses do we fall back
+        #: to active scanning, and then we disclose it in the caveats.
+        self._scan_mode = "passive"
 
     @property
     def capabilities(self) -> Capabilities:
@@ -126,6 +129,12 @@ class BleakBackend(QueueBackend):
                 "On Linux this path goes through BlueZ over D-Bus, which discards raw "
                 "advertising data and de-duplicates packets. The `hci` backend is "
                 "strictly better here — use it unless it cannot start.",
+            )
+        if self._scan_mode == "active":
+            caveats.append(
+                "This platform did not permit passive scanning, so active scanning is in "
+                "use — it transmits scan requests. If strictly receive-only capture matters "
+                "to you, use the `hci` backend on Linux or a sniffer.",
             )
         return Capabilities(
             name=f"CoreBluetooth via bleak ({platform.system()})",
@@ -174,17 +183,30 @@ class BleakBackend(QueueBackend):
             ) from exc
 
         self._loop = asyncio.get_running_loop()
-        kwargs: dict[str, object] = {"scanning_mode": "active"}
+        base_kwargs: dict[str, object] = {}
         if self.adapter:
-            kwargs["adapter"] = self.adapter
-        try:
-            # Passive scanning is what we want, but it is only supported on
-            # BlueZ and needs a filter; active is the portable default.
-            self._scanner = BleakScanner(detection_callback=self._on_detection, **kwargs)
-            await self._scanner.start()
-        except Exception as exc:
+            base_kwargs["adapter"] = self.adapter
+
+        # Receive-only is the default posture, so try passive scanning first —
+        # passive never transmits a scan request. Passive is not available on
+        # every platform/adapter (BlueZ needs a filter), so fall back to active
+        # if it will not start, and disclose that fallback in the capabilities.
+        last_exc: Exception | None = None
+        for mode in ("passive", "active"):
+            try:
+                self._scanner = BleakScanner(
+                    detection_callback=self._on_detection, scanning_mode=mode, **base_kwargs
+                )
+                await self._scanner.start()
+                self._scan_mode = mode
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 — try the next mode
+                last_exc = exc
+                self._scanner = None
+        if last_exc is not None:
             raise CaptureError(
-                f"Could not start scanning: {exc}",
+                f"Could not start scanning: {last_exc}",
                 remedy=(
                     "On macOS, grant Bluetooth permission to your terminal in System "
                     "Settings › Privacy & Security › Bluetooth, then try again. "
@@ -192,7 +214,7 @@ class BleakBackend(QueueBackend):
                     if self._is_macos
                     else "Check that the adapter is up and that bluetoothd is running."
                 ),
-            ) from exc
+            ) from last_exc
 
         await super().start()
         self._status = BackendStatus(
@@ -223,11 +245,7 @@ class BleakBackend(QueueBackend):
             getattr(advertisement_data, "tx_power", None),
         )
         address = str(getattr(device, "address", "") or "")
-        if self._is_macos:
-            address_type = AddressType.OPAQUE
-        else:
-            # BlueZ reports a MAC, but not reliably its type; infer from the bits.
-            address_type = classify_address(address, random=not _looks_public(address))
+        address_type = _resolve_address_type(device, address, self._is_macos)
 
         self.emit(
             Advertisement(
@@ -245,24 +263,29 @@ class BleakBackend(QueueBackend):
             )
         )
 
-    async def stream(self) -> AsyncIterator[Event]:
-        yield self._status
-        async for event in super().stream():
-            yield event
 
 
-def _looks_public(address: str) -> bool:
-    """A crude guess for BlueZ, which does not tell us the address type.
+def _resolve_address_type(device: object, address: str, is_macos: bool) -> AddressType:
+    """Best available address type from what the OS actually tells us.
 
-    Random static, resolvable and non-resolvable addresses all have specific
-    top-bit patterns; the OUI space of a public address rarely collides with
-    the 0b11 static pattern. This is a heuristic and is treated as one.
+    macOS never reveals the real address, so it is always OPAQUE. On BlueZ the
+    device details carry the true "AddressType" ("public"/"random"), and when
+    they do we use it — a public address must not be run through the random-bit
+    classifier, which would read a normal OUI's top bits as a private address
+    and invert the entire privacy verdict. When the type is genuinely unknown we
+    return UNKNOWN rather than guessing, so an unknowable device is not fed into
+    rotation-correlation or scored as if it were deliberately private.
     """
-    try:
-        msb = int(address.split(":")[0], 16)
-    except (ValueError, IndexError):
-        return True
-    return (msb >> 6) not in (0b11, 0b01, 0b00)
+    if is_macos:
+        return AddressType.OPAQUE
+    details = getattr(device, "details", None)
+    props = details.get("props", {}) if isinstance(details, dict) else {}
+    declared = str(props.get("AddressType", "")).lower() if isinstance(props, dict) else ""
+    if declared == "public":
+        return AddressType.PUBLIC
+    if declared == "random":
+        return classify_address(address, random=True)
+    return AddressType.UNKNOWN
 
 
 register("bleak", BleakBackend, priority=40)

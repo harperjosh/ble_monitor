@@ -325,29 +325,43 @@ def _check_sniffers(report: Report) -> None:
         return
 
     from blemon.capture.nrf_sniffer import detect_nordic
-    from blemon.capture.sniffle import detect_sniffers
+    from blemon.capture.sniffle import detect_sniffers, probe_firmware
 
     sniffle = detect_sniffers()
     nordic = detect_nordic()
 
     if sniffle:
         for found in sniffle:
-            report.add(
-                OK,
-                f"Sniffle-compatible sniffer: {found.description}",
-                f"Will open at {found.baudrate} baud. This is the backend that can "
-                "follow connections and see what devices say to each other.",
-            )
+            # A device with the right USB identity is not necessarily flashed
+            # with Sniffle — a factory SONOFF ships with Zigbee firmware. Ask it.
+            version = probe_firmware(found.port, found.baudrate)
+            if version:
+                report.add(
+                    OK,
+                    f"Sniffle sniffer: {found.description}",
+                    f"Responded to a version query (firmware: {version}). This is the "
+                    "backend that can follow connections.",
+                )
+            else:
+                report.add(
+                    WARN,
+                    f"Sniffle-compatible hardware: {found.description}",
+                    "The USB identity matches, but it did not answer a version query — "
+                    "it is probably not flashed with Sniffle yet (a factory SONOFF "
+                    "dongle ships with Zigbee firmware).",
+                    FLASH_SNIFFLE,
+                )
     if nordic:
         for found in nordic:
+            is_sniffer = found.firmware == "sniffer"
             report.add(
-                OK if "Sniffer firmware" in found.description else WARN,
+                OK if is_sniffer else WARN,
                 f"Nordic device: {found.description}",
                 ""
-                if "Sniffer firmware" in found.description
+                if is_sniffer
                 else "This looks like a dongle in bootloader mode rather than running "
                 "sniffer firmware. It will connect but send nothing.",
-                "" if "Sniffer firmware" in found.description else FLASH_NRF,
+                "" if is_sniffer else FLASH_NRF,
             )
 
     if not sniffle and not nordic:

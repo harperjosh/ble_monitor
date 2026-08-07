@@ -15,7 +15,11 @@ export function Waterfall({
   onTogglePause: () => void;
 }) {
   const [filter, setFilter] = useState("");
-  const [expanded, setExpanded] = useState<number | null>(null);
+  // Track the open row by a stable per-packet identity, not its array index —
+  // the list is rebuilt newest-first on every incoming packet, so an index
+  // would silently point at a different packet a moment after you expand one.
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const rowId = (p: PacketRow) => `${p.t}-${p.address}-${p.raw}`;
 
   const rows = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -57,12 +61,13 @@ export function Waterfall({
         )}
         {rows.map((p, i) => {
           const time = new Date(p.t * 1000);
-          const isOpen = expanded === i;
+          const id = rowId(p);
+          const isOpen = expanded === id;
           return (
-            <div key={`${p.t}-${p.address}-${i}`}>
+            <div key={id}>
               <div
                 className={`wf-row${i === 0 && !paused ? " new" : ""}`}
-                onClick={() => setExpanded(isOpen ? null : i)}
+                onClick={() => setExpanded(isOpen ? null : id)}
               >
                 <span className="wf-time">
                   {time.toLocaleTimeString([], { hour12: false })}

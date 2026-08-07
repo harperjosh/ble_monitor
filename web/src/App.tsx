@@ -40,12 +40,23 @@ export default function App() {
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
 
+  // Packets arrive at radio rate. Buffer them in a ref and flush to state a few
+  // times a second, so an incoming packet does not re-render the whole app
+  // hundreds of times per second (and copy the whole feed array each time).
+  const feedBuffer = useRef<PacketRow[]>([]);
+
   useEffect(() => {
     return connect({
       onState: setLink,
       onSnapshot: (s) => {
         setDevices(new Map(s.devices.map((d) => [d.key, d])));
-        setFeed(s.feed ?? []);
+        // Only the initial snapshot carries the feed; the periodic sweep
+        // snapshot omits it. Guarding here stops the live waterfall from being
+        // wiped to empty every 10 seconds.
+        if (s.feed) {
+          feedBuffer.current = [];
+          setFeed(s.feed);
+        }
         setAlerts(s.alerts);
         setStats(s.stats);
         setBackend(s.backend);
@@ -55,7 +66,7 @@ export default function App() {
         switch (m.type) {
           case "packet":
             if (!pausedRef.current) {
-              setFeed((f) => (f.length > FEED_CAP ? [...f.slice(-FEED_CAP + 1), m.packet] : [...f, m.packet]));
+              feedBuffer.current.push(m.packet);
             }
             break;
           case "devices":
@@ -92,6 +103,21 @@ export default function App() {
     });
   }, []);
 
+  // Flush the packet buffer into feed state at ~5 Hz. One re-render per flush
+  // instead of one per packet.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (feedBuffer.current.length === 0) return;
+      const incoming = feedBuffer.current;
+      feedBuffer.current = [];
+      setFeed((f) => {
+        const merged = f.concat(incoming);
+        return merged.length > FEED_CAP ? merged.slice(-FEED_CAP) : merged;
+      });
+    }, 200);
+    return () => window.clearInterval(timer);
+  }, []);
+
   // The room summary is cheap and only changes on the sweep, so poll it rather
   // than recomputing device statistics in the browser on every packet.
   useEffect(() => {
@@ -111,6 +137,8 @@ export default function App() {
     () => [...devices.values()].sort((a, b) => (b.rssi_smoothed ?? -127) - (a.rssi_smoothed ?? -127)),
     [devices],
   );
+
+  const unacked = useMemo(() => alerts.filter((a) => !a.acknowledged), [alerts]);
 
   const follow = useCallback(async (key: string) => {
     try {
@@ -140,10 +168,10 @@ export default function App() {
             <span><b>{devices.size}</b> devices</span>
             <span><b>{stats.packets_per_second}</b> pkt/s</span>
             <span><b>{stats.packets}</b> total</span>
-            {alerts.filter((a) => !a.acknowledged).length > 0 && (
+            {unacked.length > 0 && (
               <span style={{ color: "var(--alarm)" }}>
                 <b style={{ color: "var(--alarm)" }}>
-                  {alerts.filter((a) => !a.acknowledged).length}
+                  {unacked.length}
                 </b>{" "}
                 alerts
               </span>
@@ -215,7 +243,7 @@ export default function App() {
             </div>
             <div className="card">
               <h3>alerts</h3>
-              {alerts.filter((a) => !a.acknowledged).length === 0 ? (
+              {unacked.length === 0 ? (
                 <p className="prose tiny" style={{ margin: 0 }}>
                   Nothing to flag. Alerts appear here when a known tracker stays near you
                   for a sustained period, or an unidentified device with a rotating
@@ -228,7 +256,7 @@ export default function App() {
           </div>
         )}
 
-        {alerts.filter((a) => !a.acknowledged).length > 0 && tab !== "about" && (
+        {unacked.length > 0 && tab !== "about" && (
           <div style={{ position: "absolute", top: 12, right: 12, width: "min(380px, 42vw)", zIndex: 15 }}>
             <Alerts alerts={alerts.slice(0, 2)} onSelect={setSelected} />
           </div>

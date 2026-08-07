@@ -20,13 +20,19 @@ import asyncio
 import struct
 import threading
 import time
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from blemon.capture.base import BackendStatus, CaptureError, Event, QueueBackend, register
+from blemon.capture.base import BackendStatus, CaptureError, QueueBackend, register
 from blemon.capture.llparse import parse_adv_pdu
 from blemon.decode.link import decode_data_pdu
-from blemon.models import Advertisement, Capabilities, LinkEvent, PduType, classify_address
+from blemon.models import (
+    AddressType,
+    Advertisement,
+    Capabilities,
+    LinkEvent,
+    PduType,
+    classify_address,
+)
 
 SLIP_START = 0xAB
 SLIP_END = 0xBC
@@ -50,12 +56,14 @@ GO_IDLE = 0xFE
 
 PHY_NAMES = {0: "1M", 1: "2M", 2: "Coded", 3: "Coded"}
 
-#: Nordic dongles and dev kits, by USB identity.
-NORDIC_IDS: dict[tuple[int, int], str] = {
-    (0x1915, 0x520F): "nRF52840 Dongle (Nordic bootloader)",
-    (0x1915, 0xC00A): "nRF52840 Dongle (Sniffer firmware)",
-    (0x1366, 0x0105): "nRF52840 DK (J-Link)",
-    (0x1366, 0x1015): "nRF52840 DK (J-Link)",
+#: Nordic dongles and dev kits, by USB identity: (name, firmware state). The
+#: firmware state is derived from the PID so doctor branches on a structured
+#: value rather than substring-matching presentation text.
+NORDIC_IDS: dict[tuple[int, int], tuple[str, str]] = {
+    (0x1915, 0x520F): ("nRF52840 Dongle (Nordic bootloader)", "bootloader"),
+    (0x1915, 0xC00A): ("nRF52840 Dongle (Sniffer firmware)", "sniffer"),
+    (0x1366, 0x0105): ("nRF52840 DK (J-Link)", "unknown"),
+    (0x1366, 0x1015): ("nRF52840 DK (J-Link)", "unknown"),
 }
 
 
@@ -65,6 +73,9 @@ class DetectedNordic:
     description: str
     vid: int
     pid: int
+    #: "sniffer" | "bootloader" | "unknown" — whether it is running nRF Sniffer
+    #: firmware, as far as the USB identity can tell.
+    firmware: str = "unknown"
 
 
 def detect_nordic() -> list[DetectedNordic]:
@@ -76,17 +87,31 @@ def detect_nordic() -> list[DetectedNordic]:
     for port in list_ports.comports():
         if port.vid is None or port.pid is None:
             continue
-        name = NORDIC_IDS.get((port.vid, port.pid))
-        if name:
+        entry = NORDIC_IDS.get((port.vid, port.pid))
+        if entry:
+            name, firmware = entry
             out.append(
                 DetectedNordic(
                     port=port.device,
                     description=f"{name} on {port.device}",
                     vid=port.vid,
                     pid=port.pid,
+                    firmware=firmware,
                 )
             )
     return out
+
+
+# Nordic's nRF Sniffer SLIP variant escapes a special byte as ESC followed by
+# (byte + 1), NOT the RFC-1055 XOR-0x20 convention: 0xAB->CD AC, 0xBC->CD BD,
+# 0xCD->CD CE. Using XOR here silently corrupts any frame whose payload contains
+# a 0xAB/0xBC/0xCD byte (common in MAC/counter fields), in both directions.
+def _slip_unescape(byte: int) -> int:
+    return (byte - 1) & 0xFF
+
+
+def _slip_escape(byte: int) -> int:
+    return (byte + 1) & 0xFF
 
 
 def slip_encode(payload: bytes) -> bytes:
@@ -94,7 +119,7 @@ def slip_encode(payload: bytes) -> bytes:
     for byte in payload:
         if byte in (SLIP_START, SLIP_END, SLIP_ESC):
             out.append(SLIP_ESC)
-            out.append(byte ^ 0x20)
+            out.append(_slip_escape(byte))
         else:
             out.append(byte)
     out.append(SLIP_END)
@@ -119,7 +144,7 @@ class SlipDecoder:
                     self._escaped = False
                 continue
             if self._escaped:
-                self._buffer.append(byte ^ 0x20)
+                self._buffer.append(_slip_unescape(byte))
                 self._escaped = False
             elif byte == SLIP_ESC:
                 self._escaped = True
@@ -261,7 +286,7 @@ class NrfSnifferBackend(QueueBackend):
         )
         self._serial.write(slip_encode(header + payload))
 
-    async def follow(self, address: str) -> bool:
+    async def follow(self, address: str, address_type: str | None = None) -> bool:
         if self._serial is None:
             return False
         try:
@@ -270,8 +295,20 @@ class NrfSnifferBackend(QueueBackend):
             return False
         if len(mac) != 6:
             return False
+        # The firmware filters on address AND address type, so following a
+        # public-address peripheral with the type hardcoded to random never
+        # matches. Use the known type; when it is unknown, fall back to the
+        # top-bit classification (a public MAC's bits classify as UNKNOWN, which
+        # we treat as public rather than forcing random).
+        if address_type == "public":
+            type_byte = 0x00
+        elif address_type in ("random_static", "resolvable_private", "non_resolvable_private"):
+            type_byte = 0x01
+        else:
+            type_byte = 0x01 if classify_address(address, True).is_rotating or \
+                classify_address(address, True) is AddressType.RANDOM_STATIC else 0x00
         # addr(6) + addr_type(1) + follow_only_advertisements(1) + follow_only_legacy(1)
-        self._send(REQ_FOLLOW, mac + bytes([0x01, 0x00, 0x00]))
+        self._send(REQ_FOLLOW, mac + bytes([type_byte, 0x00, 0x00]))
         self._followed = address.upper()
         self.emit(
             BackendStatus("following", f"Aimed at {address}.", {"target": address})
@@ -412,10 +449,6 @@ class NrfSnifferBackend(QueueBackend):
             event.detail.setdefault("rssi", rssi)
             self.emit_threadsafe(loop, event)
 
-    async def stream(self) -> AsyncIterator[Event]:
-        yield self._status
-        async for event in super().stream():
-            yield event
 
 
 register("nrf", NrfSnifferBackend, priority=20)
