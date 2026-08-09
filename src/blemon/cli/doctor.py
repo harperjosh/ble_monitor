@@ -334,13 +334,27 @@ def _check_sniffers(report: Report) -> None:
         for found in sniffle:
             # A device with the right USB identity is not necessarily flashed
             # with Sniffle — a factory SONOFF ships with Zigbee firmware. Ask it.
-            version = probe_firmware(found.port, found.baudrate)
-            if version:
+            probe = probe_firmware(found.port, found.baudrate)
+            if probe.version:
                 report.add(
                     OK,
                     f"Sniffle sniffer: {found.description}",
-                    f"Responded to a version query (firmware: {version}). This is the "
-                    "backend that can follow connections.",
+                    f"Responded to a version query (firmware: {probe.version}). This is "
+                    "the backend that can follow connections.",
+                )
+            elif probe.unreachable:
+                # Could not talk to it at all. That says nothing about the
+                # firmware, and telling the user to reflash a dongle that is
+                # merely busy — because their own `blemon serve` has it open —
+                # would be actively wrong.
+                report.add(
+                    INFO,
+                    f"Sniffle-compatible hardware: {found.description}",
+                    f"The USB identity matches, but the port could not be opened to "
+                    f"check the firmware ({probe.unreachable}). This is usually another "
+                    "process already using it — a running `blemon serve` — or missing "
+                    "permission on the serial device (on Linux, add yourself to the "
+                    "`dialout` group and log back in).",
                 )
             else:
                 report.add(

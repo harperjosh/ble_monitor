@@ -142,6 +142,11 @@ export interface Device {
 }
 
 export interface PacketRow {
+  /** Client-assigned arrival sequence, unique within this page's session.
+   *  Backends stamp a whole batch of reports with one timestamp, and a static
+   *  beacon repeats an identical payload across channels, so timestamp +
+   *  address + raw is not unique and cannot serve as a React key. */
+  seq?: number;
   t: number;
   device_key: string;
   address: string;

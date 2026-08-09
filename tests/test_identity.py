@@ -208,15 +208,26 @@ class TestTrackerAlerts:
         device.is_mine = True
         assert evaluate_all([device]) == []
 
-    def test_a_separated_tracker_is_attention_immediately(self):
+    def _separated(self, seconds: float):
         d = make_device(
             [fx.google_find_my_device(unwanted=True)] * 10,
             address="72:0B:5D:E1:44:8C", random=True, rssi=-55,
-            start=time.time() - 120, interval=12,
+            start=time.time() - seconds, interval=seconds / 10,
         )
         d.identification = identify(d)
-        alerts = evaluate_all([d])
+        return d
+
+    def test_a_separated_tracker_that_persists_is_attention(self):
+        alerts = evaluate_all([self._separated(20 * 60)])
         assert alerts and alerts[0].level is AlertLevel.ATTENTION
+
+    def test_a_separated_tracker_seen_once_in_passing_is_not_alerted_on(self):
+        # Any Apple device in offline-finding mode broadcasts this frame — a
+        # powered-off phone in a bag, an AirPods case away from its owner.
+        # Firing on first sight fills the panel with warnings about devices
+        # whose owners are sitting next to them, which is what teaches people
+        # to ignore the alert that matters.
+        assert evaluate_all([self._separated(30)]) == []
 
     def test_a_distant_tracker_is_not_alerted_on(self):
         assert evaluate_all([self._tracker(60 * 60, rssi=-99)]) == []

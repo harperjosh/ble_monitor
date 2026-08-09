@@ -22,6 +22,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+from blemon.decode.adtypes import split_ad_structures
 from blemon.models import Advertisement
 
 #: libpcap link type for BLE link-layer packets with the pseudo-header.
@@ -42,33 +43,60 @@ PHDR_CRC_CHECKED = 0x0400
 PHDR_CRC_VALID = 0x0800
 
 
-#: AD types whose value is a device's advertised local name — frequently a
-#: person's own name ("Sam's iPhone"). Blanked from raw payloads on redaction.
-_NAME_AD_TYPES = (0x08, 0x09)
+#: AD types whose value identifies the person or the device directly: the two
+#: Local Name forms (frequently a person's own name, "Sam's iPhone") and the
+#: LE Bluetooth Device Address structure, which carries a MAC verbatim.
+_IDENTIFYING_AD_TYPES = (0x08, 0x09, 0x1B)
 
 
-def redact_raw_payload(raw: bytes) -> bytes:
-    """Return the raw AD payload with any Local Name value blanked.
+def _address_bytes(address: str) -> bytes | None:
+    try:
+        raw = bytes(int(part, 16) for part in address.split(":"))
+    except ValueError:
+        return None
+    return raw if len(raw) == 6 else None
+
+
+def redact_raw_payload(raw: bytes, address: str | None = None) -> bytes:
+    """Return the raw AD payload with identifying values blanked.
 
     Redacting the address and name fields of a row while emitting the raw hex
-    verbatim would leak the name straight back out — the name is right there in
-    the bytes. This walks the AD structures and zeroes the name values, leaving
-    the rest of the payload (and its framing) intact for analysis.
+    verbatim would leak them straight back out — they are right there in the
+    bytes. Two things get zeroed, leaving the framing and everything else intact
+    for analysis:
+
+    * Local Name and LE Bluetooth Device Address structures.
+    * The device's own MAC wherever it is echoed inside a payload, in either
+      byte order. Plenty of sensors do this — the pvvx/ATC layout on 0x181A puts
+      it in the first six bytes of its service data, little-endian — and this
+      tool flags it as the ``mac_in_payload`` defect elsewhere. Leaving it would
+      hand a reader the real address sitting next to its own pseudonym, which
+      defeats redaction entirely rather than weakening it.
+
+    Structures come from the canonical parser, so redaction and decoding always
+    agree about where the fields are. Where that parser gives up — a malformed
+    or truncated structure — the remainder is zeroed wholesale: we cannot prove
+    it holds no name, and redaction has to fail closed rather than ship bytes it
+    did not understand.
     """
     if not raw:
         return raw
     out = bytearray(raw)
-    i = 0
-    n = len(out)
-    while i < n:
-        length = out[i]
-        if length == 0 or i + 1 + length > n:
-            break
-        type_code = out[i + 1]
-        if type_code in _NAME_AD_TYPES:
-            for j in range(i + 2, i + 1 + length):
-                out[j] = 0
-        i += 1 + length
+    structures, trailing, _ = split_ad_structures(bytes(raw))
+    for offset, type_code, value in structures:
+        if type_code in _IDENTIFYING_AD_TYPES:
+            # offset points at the length byte; value starts two bytes later.
+            out[offset + 2 : offset + 2 + len(value)] = b"\x00" * len(value)
+    if trailing:
+        out[len(out) - len(trailing) :] = b"\x00" * len(trailing)
+    if address:
+        mac = _address_bytes(address)
+        if mac:
+            for needle in (mac, mac[::-1]):
+                start = out.find(needle)
+                while start != -1:
+                    out[start : start + 6] = b"\x00" * 6
+                    start = out.find(needle, start + 6)
     return bytes(out)
 
 
@@ -177,7 +205,7 @@ def pcap_record(adv: Advertisement, redactor: Redactor | None = None) -> bytes:
     redactor = redactor or Redactor(enabled=False)
 
     addr_bytes = redactor.address_bytes(adv.address)
-    raw = redact_raw_payload(adv.raw) if redactor.enabled else adv.raw
+    raw = redact_raw_payload(adv.raw, adv.address) if redactor.enabled else adv.raw
     ll_payload = addr_bytes + raw
     pdu = _adv_pdu_header(adv, len(ll_payload)) + ll_payload
 
@@ -290,12 +318,18 @@ def _redact_snapshot(snap: dict[str, Any], redactor: Redactor) -> dict[str, Any]
     return snap
 
 
-def _raw_hex(raw: object, redact: bool) -> str:
+def _raw_hex(raw: object, redactor: Redactor, address: str | None = None) -> str:
+    """Hex for one row's payload, redacted consistently with its address field.
+
+    Takes the Redactor rather than a bare bool so a row cannot end up with a
+    pseudonymised address beside un-redacted raw bytes — the two decisions come
+    from one object, as they already do in ``pcap_record``.
+    """
     if raw is None:
         return ""
     data = bytes(raw)
-    if redact:
-        data = redact_raw_payload(data)
+    if redactor.enabled:
+        data = redact_raw_payload(data, address)
     return data.hex()
 
 
@@ -314,7 +348,7 @@ def observations_to_json(rows: list[dict[str, Any]], redact: bool = False) -> st
                 "phy": r.get("phy"),
                 "scan_response": bool(r.get("scan_rsp")),
                 "source": r.get("source"),
-                "raw": _raw_hex(r.get("raw"), redact),
+                "raw": _raw_hex(r.get("raw"), redactor, str(r.get("address", ""))),
             }
         )
     return json.dumps(
@@ -429,7 +463,7 @@ def observations_to_csv(rows: list[dict[str, Any]], redact: bool = False) -> str
                 "phy": r.get("phy"),
                 "scan_response": bool(r.get("scan_rsp")),
                 "source": r.get("source"),
-                "raw_hex": _raw_hex(r.get("raw"), redact),
+                "raw_hex": _raw_hex(r.get("raw"), redactor, str(r.get("address", ""))),
             }
         )
     return buf.getvalue()

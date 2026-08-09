@@ -18,8 +18,11 @@ export function Waterfall({
   // Track the open row by a stable per-packet identity, not its array index —
   // the list is rebuilt newest-first on every incoming packet, so an index
   // would silently point at a different packet a moment after you expand one.
+  // The arrival sequence is both stable and unique; content is not, because a
+  // controller batches several reports under one timestamp and a static beacon
+  // repeats the same payload on all three advertising channels.
   const [expanded, setExpanded] = useState<string | null>(null);
-  const rowId = (p: PacketRow) => `${p.t}-${p.address}-${p.raw}`;
+  const rowId = (p: PacketRow) => `${p.seq ?? `${p.t}-${p.address}-${p.raw}`}`;
 
   const rows = useMemo(() => {
     const needle = filter.trim().toLowerCase();

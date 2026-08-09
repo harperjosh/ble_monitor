@@ -46,6 +46,33 @@ class AddressType(str, Enum):
     def is_stable(self) -> bool:
         return self in (AddressType.PUBLIC, AddressType.RANDOM_STATIC)
 
+    @property
+    def is_public_like(self) -> bool:
+        """Whether a radio should be told "public" when filtering on this.
+
+        PUBLIC obviously. OPAQUE and UNKNOWN mean we were never told, and public
+        is the safe default there: guessing "random" from the address bits is
+        not possible (see ``classify_address``) and gets it wrong for most real
+        public MACs, which makes a hardware address filter silently never match.
+        """
+        return self in (AddressType.PUBLIC, AddressType.OPAQUE, AddressType.UNKNOWN)
+
+    @classmethod
+    def coerce(cls, value: AddressType | str | None) -> AddressType | None:
+        """Accept an enum member, its ``value``, or nothing.
+
+        Callers hand this across process and HTTP boundaries where the enum has
+        been flattened to a string; comparing against hand-copied string
+        literals instead means adding or renaming a member silently changes
+        behaviour with no type error.
+        """
+        if value is None or isinstance(value, cls):
+            return value
+        try:
+            return cls(value)
+        except ValueError:
+            return None
+
 
 def classify_address(addr: str, random: bool) -> AddressType:
     """Classify a BLE address from its top two bits, per Core Spec Vol 6 Part B.

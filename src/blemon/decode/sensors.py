@@ -113,18 +113,55 @@ def decode_thermometer(data: bytes, context: dict[str, Any]) -> list[Decoding]:
     ]
 
 
+def _echoes_address(data: bytes, context: dict[str, Any], reverse: bool) -> bool:
+    """Whether ``data`` starts with the advertiser's own address in this order."""
+    address = str(context.get("address") or "")
+    if len(data) < 6 or address.count(":") != 5:
+        return False
+    try:
+        raw = bytes(int(part, 16) for part in address.split(":"))
+    except ValueError:
+        return False
+    return data[:6] == (raw[::-1] if reverse else raw)
+
+
 @service_data_decoder("181A", name="environmental_sensing")
 def decode_environmental(data: bytes, context: dict[str, Any]) -> list[Decoding]:
-    # The dominant way a sensor puts environmental data on 0x181A in the wild is
-    # the pvvx/ATC "custom" layout (Xiaomi LYWSD03MMC and clones reflashed with
-    # pvvx firmware):
-    #   MAC[6] little-endian, temperature int16 LE x0.01C, humidity uint16 LE
-    #   x0.01%, battery_mv uint16 LE, battery_level uint8, counter, flags.
-    # The MAC is stored low byte first, so it is reversed for display; battery
-    # percent lives at byte 12, not byte 10 (10-11 are millivolts).
+    # Two incompatible layouts share 0x181A. Assuming either one renders the
+    # other's MAC byte-reversed and its readings wrong, while looking perfectly
+    # plausible — so they have to be told apart:
+    #
+    # * pvvx "custom" (15 bytes, Xiaomi LYWSD03MMC and clones on pvvx firmware):
+    #   MAC[6] little-endian, temp int16 LE x0.01C, humidity uint16 LE x0.01%,
+    #   battery_mv uint16 LE, battery_level uint8, counter, flags. Battery
+    #   percent is at byte 12 — 10-11 are millivolts.
+    # * ATC1441 (13 bytes): MAC[6] big-endian, temp int16 BE x0.1C, humidity
+    #   uint8 %, battery_level uint8, battery_mv uint16 BE, counter.
+    #
+    # Both echo the sensor's own address, so matching those six bytes against
+    # the advertiser's address settles the byte order outright. Length only
+    # decides it when the address is unknown or does not match.
     fields: list[Field_] = []
     parts: list[str] = []
-    if len(data) >= 10:
+    if _echoes_address(data, context, reverse=True):
+        is_atc = False
+    elif _echoes_address(data, context, reverse=False):
+        is_atc = True
+    else:
+        is_atc = len(data) == 13
+    if is_atc and len(data) >= 12:
+        addr = ":".join(f"{b:02X}" for b in data[0:6])
+        temp = struct.unpack(">h", data[6:8])[0] / 10.0
+        fields += [
+            Field_("device_address", addr, 0, 6, "echoed inside the payload (big-endian)"),
+            Field_("temperature_c", round(temp, 2), 6, 2),
+            Field_("humidity_percent", data[8], 8, 1),
+            Field_("battery_percent", data[9], 9, 1),
+            Field_("battery_mv", struct.unpack(">H", data[10:12])[0], 10, 2),
+            Field_("layout", "ATC1441", 0, 0),
+        ]
+        parts += [f"{temp:.1f} °C", f"{data[8]}% humidity", f"{data[9]}% battery"]
+    elif len(data) >= 10:
         addr = ":".join(f"{b:02X}" for b in data[5::-1])
         temp = struct.unpack("<h", data[6:8])[0] / 100.0
         hum = struct.unpack("<H", data[8:10])[0] / 100.0
@@ -132,6 +169,7 @@ def decode_environmental(data: bytes, context: dict[str, Any]) -> list[Decoding]
             Field_("device_address", addr, 0, 6, "echoed inside the payload (little-endian)"),
             Field_("temperature_c", round(temp, 2), 6, 2),
             Field_("humidity_percent", round(hum, 2), 8, 2),
+            Field_("layout", "pvvx", 0, 0),
         ]
         parts += [f"{temp:.1f} °C", f"{hum:.0f}% humidity"]
         if len(data) >= 12:

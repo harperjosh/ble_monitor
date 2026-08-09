@@ -33,7 +33,11 @@ export function Inventory({
     let list = devices.filter((d) => {
       if (only === "trackers" && !d.is_tracker) return false;
       if (only === "rotating" && !d.address_is_rotating) return false;
-      if (only === "open" && d.exposure.band !== "wide open") return false;
+      // `material`, not `band`: the city renders every glass building at score
+      // >= 45, so filtering on the "wide open" band (>= 70) silently hides the
+      // whole chatty band from the list meant to select exactly what the city
+      // is showing. One rule, read from Exposure, in both views.
+      if (only === "open" && d.exposure.material !== "glass") return false;
       if (only === "mine" && !d.is_mine) return false;
       if (!needle) return true;
       return `${d.display_name} ${d.address} ${d.names.join(" ")} ${d.service_uuids.join(" ")} ${d.company_names.join(" ")} ${Object.keys(d.protocols).join(" ")}`

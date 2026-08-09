@@ -6,6 +6,7 @@ and fails against the code as it was before the fix.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -36,6 +37,26 @@ def decoding(parsed, protocol):
         if d.protocol == protocol:
             return d
     raise AssertionError(f"{protocol} not decoded: {sorted(d.protocol for d in parsed.decodings)}")
+
+
+class _RecordingSerial:
+    """Stands in for a pyserial port so command framing can be inspected."""
+
+    def __init__(self):
+        self.written = b""
+
+    def write(self, data: bytes) -> None:
+        self.written += data
+
+    def follow_type_byte(self) -> int:
+        """The address-type byte of the REQ_FOLLOW payload just written.
+
+        Frame layout: SLIP-encoded (header[6] + payload), and the follow payload
+        is addr[6] + addr_type[1] + two flag bytes.
+        """
+        frames = SlipDecoder().feed(self.written)
+        assert frames, "no SLIP frame was written"
+        return frames[-1][6 + 6]
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +114,8 @@ class TestDecodeFixes:
         assert any("Xiaomi" in label for label in labels)
 
     def test_pvvx_environmental_battery_and_mac(self):
-        # pvvx custom 0x181A: MAC(LE) + temp + hum + battery_mv + battery_pct.
+        # pvvx custom 0x181A, the full 15-byte frame the firmware actually
+        # sends: MAC(LE) + temp + hum + battery_mv + battery_pct + count + flags.
         import struct
 
         mac = bytes.fromhex("A4C1381122FF")  # stored low-byte-first
@@ -103,15 +125,39 @@ class TestDecodeFixes:
             + struct.pack("<H", 4850)  # 48.5 %
             + struct.pack("<H", 2977)  # battery mV
             + bytes([93])  # battery %
+            + bytes([7, 0])  # counter, flags
         )
         raw = fx.payload(fx.service_data16(0x181A, body))
-        d = decoding(parse(adv(raw)), "environmental_sensing")
+        d = decoding(parse(adv(raw, address="FF:22:11:38:C1:A4")), "environmental_sensing")
         battery = next(f.value for f in d.fields if f.name == "battery_percent")
         mv = next(f.value for f in d.fields if f.name == "battery_mv")
         addr = next(f.value for f in d.fields if f.name == "device_address")
         assert battery == 93
         assert mv == 2977
         assert addr == "FF:22:11:38:C1:A4"  # reversed for display
+
+    def test_atc1441_environmental_is_not_read_as_pvvx(self):
+        # ATC1441 shares 0x181A but stores the MAC big-endian and packs its
+        # fields differently. Decoding it with the pvvx layout yields a
+        # byte-reversed address and nonsense readings that still look plausible.
+        import struct
+
+        body = (
+            bytes.fromhex("A4C1381122FF")  # MAC, big-endian
+            + struct.pack(">h", 213)  # 21.3 C
+            + bytes([48])  # 48 % humidity
+            + bytes([93])  # 93 % battery
+            + struct.pack(">H", 2977)  # battery mV
+            + bytes([7])  # counter
+        )
+        raw = fx.payload(fx.service_data16(0x181A, body))
+        d = decoding(parse(adv(raw, address="A4:C1:38:11:22:FF")), "environmental_sensing")
+        value = {f.name: f.value for f in d.fields}
+        assert value["device_address"] == "A4:C1:38:11:22:FF"  # not reversed
+        assert value["temperature_c"] == 21.3
+        assert value["humidity_percent"] == 48
+        assert value["battery_percent"] == 93
+        assert value["battery_mv"] == 2977
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +304,7 @@ class TestServiceFixes:
 
     def test_acknowledged_alert_survives_a_refresh(self, tmp_path):
         # Build a hub with a persistent separated tracker so an alert exists.
-        import random
-
         hub = Hub(create("synthetic", seed=9), store=Store(tmp_path / "a.db"), persist=False)
-        rng = random.Random(3)
         d = Device(key="72:0B:5D:E1:44:8C", address="72:0B:5D:E1:44:8C",
                    first_seen=time.time() - 1800)
         for _ in range(30):
@@ -276,4 +319,315 @@ class TestServiceFixes:
         # A later sweep regenerates alerts; the dismissal must stick.
         hub._refresh_alerts()
         assert all(a.acknowledged for a in hub.alerts if a.key == key)
-        del rng
+
+
+# ---------------------------------------------------------------------------
+# Second review pass — defects found in the first round of fixes
+# ---------------------------------------------------------------------------
+
+
+class TestPurgeKeepsCaptureAlive:
+    def test_purge_reopens_the_session_so_writes_still_work(self, tmp_path):
+        # purge() deletes every sessions row, including the live one. With
+        # foreign keys on, the next insert used to fail and take the ingest
+        # loop down with it, silently ending capture for the process's life.
+        store = Store(tmp_path / "p.db")
+        hub = Hub(create("synthetic", seed=1), store=store, persist=True)
+        hub.session_id = store.start_session("live", backend="synthetic", capabilities={})
+        store.purge(keep_labels=True)
+        hub.after_purge()
+        assert hub.session_id is not None
+        d = Device(key="AA:BB:CC:DD:EE:01", address="AA:BB:CC:DD:EE:01")
+        store.snapshot_devices(hub.session_id, [d])  # must not raise IntegrityError
+
+    def test_purge_clears_dismissals_it_just_deleted(self, tmp_path):
+        store = Store(tmp_path / "p.db")
+        hub = Hub(create("synthetic", seed=1), store=store, persist=False)
+        hub._acknowledged = {"separated:AA": "attention"}
+        store.purge(keep_labels=True)
+        hub.after_purge()
+        assert hub._acknowledged == {}
+
+
+class TestRetentionScoping:
+    def test_retention_never_deletes_the_live_session(self, tmp_path):
+        store = Store(tmp_path / "r.db")
+        session_id = store.start_session("live", backend="synthetic", capabilities={})
+        store._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?",
+            (time.time() - 400 * 86400, session_id),
+        )
+        store._conn.commit()
+        store.enforce_retention(exclude_session=session_id)
+        assert [s["id"] for s in store.sessions()] == [session_id]
+
+    def test_retention_still_ages_out_other_sessions(self, tmp_path):
+        store = Store(tmp_path / "r.db")
+        old = store.start_session("old", backend="synthetic", capabilities={})
+        live = store.start_session("live", backend="synthetic", capabilities={})
+        store._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (time.time() - 400 * 86400, old)
+        )
+        store._conn.commit()
+        store.enforce_retention(exclude_session=live)
+        assert [s["id"] for s in store.sessions()] == [live]
+
+
+class TestReplayPlan:
+    def test_keyset_replay_does_not_sort(self, tmp_path):
+        # Ordering by a column the chosen index does not cover makes SQLite sort
+        # every remaining row of the session on each batch — slower than the
+        # OFFSET scan the keyset pagination replaced.
+        store = Store(tmp_path / "q.db")
+        plan = " ".join(
+            r[-1]
+            for r in store._conn.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM observations "
+                "WHERE session_id=? AND id>? ORDER BY id ASC LIMIT ?",
+                (1, 0, 10),
+            )
+        )
+        assert "TEMP B-TREE" not in plan
+        assert "idx_obs_session_id" in plan
+
+
+class TestFollowAddressType:
+    @pytest.mark.parametrize(
+        "address", ["3C:9C:0F:44:21:AB", "00:1A:7D:DA:71:13", "B8:27:EB:12:34:56"]
+    )
+    def test_a_public_address_is_followed_as_public(self, address):
+        # classify_address(addr, True) answers "given this is random, which
+        # kind" — so feeding it a public MAC returns a confident random subtype
+        # and the firmware's address+type filter then never matches.
+        backend = create("nrf")
+        backend._serial = _RecordingSerial()
+        asyncio.run(backend.follow(address, address_type=AddressType.PUBLIC))
+        assert backend._serial.follow_type_byte() == 0x00
+
+    def test_an_unknown_type_defaults_to_public_not_random(self):
+        backend = create("nrf")
+        backend._serial = _RecordingSerial()
+        asyncio.run(backend.follow("3C:9C:0F:44:21:AB", address_type=None))
+        assert backend._serial.follow_type_byte() == 0x00
+
+    @pytest.mark.parametrize(
+        "kind",
+        [AddressType.RANDOM_STATIC, AddressType.RESOLVABLE_PRIVATE,
+         AddressType.NON_RESOLVABLE_PRIVATE],
+    )
+    def test_a_random_address_is_followed_as_random(self, kind):
+        backend = create("nrf")
+        backend._serial = _RecordingSerial()
+        asyncio.run(backend.follow("72:0B:5D:E1:44:8C", address_type=kind))
+        assert backend._serial.follow_type_byte() == 0x01
+
+    def test_the_enum_value_string_is_accepted_too(self):
+        # The HTTP layer used to flatten this to a string; both must work.
+        backend = create("nrf")
+        backend._serial = _RecordingSerial()
+        asyncio.run(backend.follow("72:0B:5D:E1:44:8C", address_type="random_static"))
+        assert backend._serial.follow_type_byte() == 0x01
+
+
+class TestProbeResultSurvives:
+    def _probed(self):
+        from blemon.models import Category, Confidence, Evidence, Guess
+
+        return Guess(label="Sony WF-1000XM5", confidence=Confidence.CERTAIN,
+                     evidence=[Evidence("read from the device over GATT")],
+                     category=Category.AUDIO, score=1.0)
+
+    def test_absorb_carries_probe_guesses_onto_the_survivor(self):
+        elder = Device(key="AA:BB:CC:DD:EE:01", address="AA:BB:CC:DD:EE:01")
+        younger = Device(key="AA:BB:CC:DD:EE:02", address="AA:BB:CC:DD:EE:02")
+        younger.probe_guesses = [self._probed()]
+        elder.absorb(younger, 0.9, ["same payload"])
+        assert [g.label for g in elder.probe_guesses] == ["Sony WF-1000XM5"]
+
+    def test_probe_guesses_are_serialized_so_they_survive_a_restart(self):
+        d = Device(key="AA:BB:CC:DD:EE:01", address="AA:BB:CC:DD:EE:01")
+        d.probe_guesses = [self._probed()]
+        assert d.to_dict()["probe_guesses"][0]["label"] == "Sony WF-1000XM5"
+
+    def test_identify_does_not_grow_the_stored_evidence(self):
+        # identify() stamps and merges into the guesses it is handed, so
+        # returning the stored objects would grow this list on every tick — and
+        # it is re-serialized into every snapshot and every SQLite row.
+        d = Device(key="AA:BB:CC:DD:EE:01", address="AA:BB:CC:DD:EE:01")
+        d.probe_guesses = [self._probed()]
+        before = len(d.probe_guesses[0].evidence)
+        for _ in range(5):
+            d.identification = identify(d)
+        assert len(d.probe_guesses[0].evidence) == before
+        assert d.probe_guesses[0].matcher == ""
+
+
+class TestAlertDismissalScoping:
+    def _hub_with_alert(self, tmp_path):
+        hub = Hub(create("synthetic", seed=9), store=Store(tmp_path / "a.db"), persist=False)
+        d = Device(key="72:0B:5D:E1:44:8C", address="72:0B:5D:E1:44:8C",
+                   first_seen=time.time() - 1800)
+        for _ in range(30):
+            d.observe(parse(adv(fx.payload(fx.find_my(separated=True)),
+                                address="72:0B:5D:E1:44:8C", random=True, rssi=-55)))
+        d.identification = identify(d)
+        hub.devices[d.key] = d
+        hub._refresh_alerts()
+        return hub, d
+
+    def test_an_escalated_alert_is_raised_again_after_dismissal(self, tmp_path):
+        # A dismissal silences the level it was made at. Escalation — the same
+        # tag turning up in a second place — is new information and is the
+        # signal the whole feature exists to deliver.
+        hub, device = self._hub_with_alert(tmp_path)
+        assert hub.alerts
+        hub._acknowledged = {a.key: "info" for a in hub.alerts}
+        hub._refresh_alerts()
+        assert any(not a.acknowledged for a in hub.alerts)
+
+    def test_a_dismissal_at_the_same_level_still_sticks(self, tmp_path):
+        hub, _ = self._hub_with_alert(tmp_path)
+        key = hub.alerts[0].key
+        hub.acknowledge_alert(key)
+        hub._refresh_alerts()
+        assert all(a.acknowledged for a in hub.alerts if a.key == key)
+
+    def test_a_merge_carries_the_dismissal_to_the_surviving_key(self, tmp_path):
+        # Alert keys embed the device key, and a merge keeps the elder's — so
+        # without a remap the alert the user just dismissed comes straight back
+        # under the survivor's key on the next sweep.
+        hub = Hub(create("synthetic", seed=1), persist=False)
+        hub._acknowledged = {"separated:BB:BB:BB:BB:BB:BB": "attention"}
+        hub._address_index = {"BB:BB:BB:BB:BB:BB": "AA:AA:AA:AA:AA:AA"}
+        hub._remap_acknowledged("BB:BB:BB:BB:BB:BB")
+        assert hub._acknowledged.get("separated:AA:AA:AA:AA:AA:AA") == "attention"
+
+
+class TestRedactionCoversEchoedAddresses:
+    def test_a_mac_echoed_in_service_data_is_blanked(self):
+        # pvvx/ATC sensors put their own MAC in the payload. Leaving it hands a
+        # reader the real address next to its own pseudonym.
+        mac = bytes.fromhex("A4C1381122FF")
+        body = mac + bytes(9)
+        raw = fx.payload(fx.service_data16(0x181A, body))
+        out = redact_raw_payload(raw, "FF:22:11:38:C1:A4")
+        assert mac not in out
+        assert len(out) == len(raw)
+
+    def test_the_le_device_address_ad_type_is_blanked(self):
+        mac = bytes.fromhex("A4C1381122FF")
+        raw = fx.payload(bytes([8, 0x1B]) + mac + bytes([0]))
+        assert mac not in redact_raw_payload(raw, None)
+
+    def test_redaction_fails_closed_on_a_malformed_structure(self):
+        # The AD parser stops at a structure it cannot read. Redaction must not
+        # ship the remainder verbatim just because it could not parse it.
+        name = b"Sams iPhone"
+        raw = bytes([0x40, 0xFF]) + bytes([len(name) + 1, 0x09]) + name
+        assert b"Sams" not in redact_raw_payload(raw, None)
+
+    def test_ordinary_padding_is_left_alone(self):
+        raw = fx.payload(fx.complete_name("Speaker")) + bytes(6)
+        out = redact_raw_payload(raw, None)
+        assert len(out) == len(raw)
+        assert b"Speaker" not in out
+
+
+class TestBackendStatusIsHonest:
+    def test_a_dead_ingest_loop_is_not_reported_as_running(self):
+        # backend.describe() reports the backend's own status, which stays
+        # "running" after _ingest has died — so the sweep's snapshot would
+        # overwrite the error and the dashboard would show a healthy capture.
+        from blemon.capture.base import BackendStatus
+
+        hub = Hub(create("synthetic", seed=1), persist=False)
+        hub.backend_status = BackendStatus("error", "Capture stopped: disk full")
+        view = hub.backend_view()
+        assert view["running"] is False
+        assert view["status"]["state"] == "error"
+        assert "disk full" in view["status"]["detail"]
+
+    def test_a_healthy_backend_is_reported_as_the_backend_sees_it(self):
+        hub = Hub(create("synthetic", seed=1), persist=False)
+        assert hub.backend_view()["status"] == hub.backend.describe()["status"]
+
+
+class TestCapabilityHonesty:
+    def test_active_scan_fallback_admits_it_transmits(self):
+        backend = create("bleak")
+        assert backend.capabilities.can_transmit is False
+        backend._scan_mode = "active"
+        assert backend.capabilities.can_transmit is True
+
+    def test_address_type_is_read_on_non_bluez_platforms(self):
+        # Only BlueZ uses details={"props": ...}; matching just that shape
+        # silently returns UNKNOWN for every device everywhere else, which
+        # disables address-type privacy scoring instead of failing visibly.
+        class WinRTDevice:
+            class details:  # noqa: N801 — mirrors bleak's attribute shape
+                address_type = "Public"
+
+        assert (
+            _resolve_address_type(WinRTDevice(), "3C:9C:0F:44:21:AB", False)
+            is AddressType.PUBLIC
+        )
+
+
+class TestConcurrentReadsAreSafe:
+    def test_serializing_devices_while_capturing_does_not_raise(self):
+        # device_list() hands back live Device objects, and to_dict() iterates
+        # deques and Counters the capture task mutates on every packet — so
+        # serializing outside the lock raises "deque mutated during iteration"
+        # and the sync endpoints 500 several times a minute in a busy room.
+        import threading
+
+        hub = Hub(create("synthetic", seed=4), persist=False)
+        for i in range(40):
+            address = f"AA:BB:CC:DD:EE:{i:02X}"
+            hub.ingest(adv(fx.payload(fx.complete_name(f"Device {i}")), address=address))
+
+        errors: list[BaseException] = []
+        stop = threading.Event()
+
+        def capture():
+            i = 0
+            while not stop.is_set():
+                address = f"AA:BB:CC:DD:EE:{i % 40:02X}"
+                try:
+                    hub.ingest(adv(fx.payload(fx.complete_name("x")), address=address))
+                except BaseException as exc:  # noqa: BLE001 — recorded, not swallowed
+                    errors.append(exc)
+                    return
+                i += 1
+
+        writer = threading.Thread(target=capture, daemon=True)
+        writer.start()
+        try:
+            for _ in range(300):
+                try:
+                    hub.device_dicts()
+                    hub.exposure_summary()
+                except BaseException as exc:  # noqa: BLE001 — recorded, not swallowed
+                    errors.append(exc)
+                    break
+        finally:
+            stop.set()
+            writer.join(timeout=5)
+        assert not errors, f"concurrent read raised {errors[0]!r}"
+
+    def test_the_purge_endpoint_leaves_capture_able_to_write(self, tmp_path):
+        store = Store(tmp_path / "e.db")
+        hub = Hub(create("synthetic", seed=2), store=store, persist=True)
+        hub.session_id = store.start_session("live", backend="synthetic", capabilities={})
+        client = TestClient(create_app(hub))
+
+        response = client.post("/api/purge", json={"keep_labels": True})
+        assert response.status_code == 200
+        assert response.json()["session_id"] is not None
+
+        for i in range(5):
+            hub.ingest(adv(fx.payload(fx.complete_name("Speaker")),
+                           address=f"AA:BB:CC:DD:EE:{i:02X}"))
+        hub._flush()  # used to raise IntegrityError and kill the ingest task
+        stored = store._conn.execute("SELECT COUNT(*) AS c FROM observations").fetchone()
+        assert stored["c"] == 5

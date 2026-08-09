@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from blemon.decode.apple import PROXIMITY_MODELS
@@ -586,8 +587,13 @@ def by_probe(device: Device) -> Iterable[Guess]:
     engine (rather than splicing them into ``identification`` at the HTTP layer)
     means the next re-identify tick keeps them ranked first instead of silently
     discarding them.
+
+    Copies, not the stored objects: ``identify`` stamps ``matcher`` and merges
+    corroborating evidence into the guesses it is handed, so returning the
+    originals would grow the device's stored evidence list on every tick — and
+    that list is re-serialized into every snapshot and every SQLite row.
     """
-    return list(getattr(device, "probe_guesses", []) or [])
+    return [replace(g, evidence=list(g.evidence)) for g in device.probe_guesses]
 
 
 @matcher("apple_model_table")

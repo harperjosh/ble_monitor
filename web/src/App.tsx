@@ -44,6 +44,10 @@ export default function App() {
   // times a second, so an incoming packet does not re-render the whole app
   // hundreds of times per second (and copy the whole feed array each time).
   const feedBuffer = useRef<PacketRow[]>([]);
+  // Monotonic arrival counter. Packet content is not unique — a controller
+  // batches reports under one timestamp and a static beacon repeats the same
+  // payload across channels — so the waterfall needs this for its React keys.
+  const seq = useRef(0);
 
   useEffect(() => {
     return connect({
@@ -55,7 +59,7 @@ export default function App() {
         // wiped to empty every 10 seconds.
         if (s.feed) {
           feedBuffer.current = [];
-          setFeed(s.feed);
+          setFeed(s.feed.map((p) => ({ ...p, seq: seq.current++ })));
         }
         setAlerts(s.alerts);
         setStats(s.stats);
@@ -66,7 +70,14 @@ export default function App() {
         switch (m.type) {
           case "packet":
             if (!pausedRef.current) {
-              feedBuffer.current.push(m.packet);
+              feedBuffer.current.push({ ...m.packet, seq: seq.current++ });
+              // Cap on push, not only in the flush. Browsers throttle and can
+              // freeze timers in a background tab, and without a bound here a
+              // backgrounded dashboard grows this array at packet rate — every
+              // entry holding a full raw hex string.
+              if (feedBuffer.current.length > FEED_CAP) {
+                feedBuffer.current = feedBuffer.current.slice(-FEED_CAP);
+              }
             }
             break;
           case "devices":
@@ -258,7 +269,11 @@ export default function App() {
 
         {unacked.length > 0 && tab !== "about" && (
           <div style={{ position: "absolute", top: 12, right: 12, width: "min(380px, 42vw)", zIndex: 15 }}>
-            <Alerts alerts={alerts.slice(0, 2)} onSelect={setSelected} />
+            {/* Slice `unacked`, not `alerts`: sorted with acknowledged entries
+                first, alerts.slice(0, 2) can be entirely dismissed alerts, which
+                the Alerts component then filters out — leaving an empty overlay
+                while a live ATTENTION alert never surfaces. */}
+            <Alerts alerts={unacked.slice(0, 2)} onSelect={setSelected} />
           </div>
         )}
 

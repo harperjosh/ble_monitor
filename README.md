@@ -306,7 +306,11 @@ Built in, not bolted on:
   exactly what is stored and a single control that destroys it.
 - **Exports offer MAC redaction** — a keyed hash, consistent within one file so
   the data stays analysable, uncorrelatable across two files, and applied to
-  device names and the prose around them as well as to the address fields.
+  device names and the prose around them as well as to the address fields. It
+  also reaches inside the raw payload: names, the LE Device Address structure,
+  and any address a device echoes about itself (plenty of sensors do) are
+  blanked there too, since a real MAC sitting in the hex beside its own
+  pseudonym would defeat the whole exercise.
 - **Correlation across MAC rotation is deliberately conservative.** It refuses
   to link devices whose payloads are not distinctive, because merging two
   strangers' phones would be worse than counting one phone twice. It is always

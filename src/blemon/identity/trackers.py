@@ -29,6 +29,18 @@ class AlertLevel(str, Enum):
     NOTABLE = "notable"
     ATTENTION = "attention"
 
+    @property
+    def rank(self) -> int:
+        """Severity order, so an escalation can be told from a re-raise.
+
+        A dismissal silences the level it was made at and anything below it; a
+        higher level is new information and has to reach the user again.
+        """
+        return _LEVEL_RANK[self]
+
+
+_LEVEL_RANK = {AlertLevel.INFO: 0, AlertLevel.NOTABLE: 1, AlertLevel.ATTENTION: 2}
+
 
 #: How long a tracker has to hang around before it is worth mentioning.
 KNOWN_TRACKER_SECONDS = 8 * 60
@@ -38,6 +50,13 @@ UNKNOWN_PERSIST_SECONDS = 20 * 60
 UNKNOWN_MIN_ADDRESSES = 3
 #: Only alert on things that are actually close. A tracker three rooms away is noise.
 MIN_ALERT_RSSI = -80
+#: How long a tag has to be broadcasting the separated/unwanted-tracking frame
+#: before it is worth an ATTENTION alert. Any Apple device in offline-finding
+#: mode emits this — a powered-off phone in a bag, an AirPods case away from its
+#: owner — so firing on a single packet fills the panel with warnings about
+#: devices whose owners are sitting right next to them, which is what teaches
+#: people to ignore the alert that matters.
+SEPARATED_TRACKER_SECONDS = 5 * 60
 
 
 @dataclass
@@ -86,7 +105,11 @@ def evaluate(device: Device, sessions_seen: int = 1) -> list[Alert]:
     close_enough = rssi is None or rssi >= MIN_ALERT_RSSI
 
     # -- 1. A tracker that has been separated from its owner ---------------
-    if "separated_tracker" in device.tags and close_enough:
+    if (
+        "separated_tracker" in device.tags
+        and close_enough
+        and duration >= SEPARATED_TRACKER_SECONDS
+    ):
         out.append(
             Alert(
                 key=f"separated:{device.key}",

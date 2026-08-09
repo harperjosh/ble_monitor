@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from blemon.models import Advertisement, Capabilities, LinkEvent
+from blemon.models import AddressType, Advertisement, Capabilities, LinkEvent
 
 
 @dataclass
@@ -89,12 +89,15 @@ class CaptureBackend(abc.ABC):
 
     # -- optional ----------------------------------------------------------
 
-    async def follow(self, address: str, address_type: str | None = None) -> bool:
+    async def follow(
+        self, address: str, address_type: AddressType | str | None = None
+    ) -> bool:
         """Aim connection-following at one device. False if unsupported.
 
-        ``address_type`` is the device's known address type ("public"/"random"/…)
-        when the caller has it; some sniffers need it to build the correct
-        connection-follow filter. None means "not known".
+        ``address_type`` is the device's known address type when the caller has
+        it; some sniffers need it to build the correct connection-follow filter.
+        None means "not known" — which is a real answer, not a prompt to guess:
+        the type cannot be recovered from the address bits.
         """
         return False
 

@@ -28,6 +28,7 @@ from blemon.capture.base import BackendStatus, CaptureBackend
 from blemon.decode import parse
 from blemon.device import Device
 from blemon.identity import apply_links, evaluate_all, find_links, identify
+from blemon.identity.trackers import AlertLevel
 from blemon.models import Advertisement, LinkEvent, ParsedAdvertisement
 from blemon.store import Store
 from blemon.translate import describe_room
@@ -41,6 +42,10 @@ LINK_FEED_LENGTH = 400
 #: The 10s sweep enforces retention every this-many sweeps (~5 minutes). Deleting
 #: aged-out rows more often than that is pointless churn on an SD card.
 RETENTION_EVERY_SWEEPS = 30
+#: How many observations to buffer when the store is busy. The per-packet flush
+#: never waits on the store lock, so this bounds what a long VACUUM can cost in
+#: memory; beyond it the oldest rows are dropped rather than growing unbounded.
+MAX_PENDING_OBSERVATIONS = 20_000
 
 
 @dataclass
@@ -102,13 +107,15 @@ class Hub:
         #: never has to scan every device to find who a rotated address belongs
         #: to. Kept in step with device create, observe, merge and retire.
         self._address_index: dict[str, str] = {}
-        #: Alert keys the user has dismissed. The sweep regenerates Alert objects
-        #: from scratch, so without this the acknowledged flag would be lost and
-        #: dismissed alerts would reappear within one sweep.
-        self._acknowledged: set[str] = set()
-        #: Guards structural changes to self.devices against the sync API
-        #: endpoints, which read it from Starlette's threadpool while the capture
-        #: task mutates it on the event loop.
+        #: Alert key -> the level it was dismissed at. The sweep regenerates
+        #: Alert objects from scratch, so without this the acknowledged flag
+        #: would be lost and dismissed alerts would reappear within one sweep.
+        #: Storing the *level* rather than just the key means a later escalation
+        #: of the same alert still reaches the user.
+        self._acknowledged: dict[str, str] = {}
+        #: Guards self.devices and the Device objects in it against the sync API
+        #: endpoints, which read them from Starlette's threadpool while the
+        #: capture task mutates them on the event loop.
         self._lock = threading.RLock()
         self._sweeps = 0
 
@@ -118,10 +125,12 @@ class Hub:
         if self.store is not None:
             self._labels = self.store.all_labels()
             # Seed the dismissed set from storage so acknowledgements survive a
-            # restart as well as each sweep.
+            # restart as well as each sweep. Rows written before the level was
+            # recorded fall back to the level the alert had when it was stored.
             with contextlib.suppress(Exception):
                 self._acknowledged = {
-                    a["key"] for a in self.store.alerts(include_acknowledged=True)
+                    a["key"]: (a.get("acknowledged_level") or a.get("level") or "")
+                    for a in self.store.alerts(include_acknowledged=True)
                     if a.get("acknowledged")
                 }
         # Start the radio before opening a session row. If the backend fails to
@@ -142,15 +151,24 @@ class Hub:
 
     async def stop(self) -> None:
         self._stopping = True
-        with contextlib.suppress(Exception):
+        try:
             await self.backend.stop()
+        except Exception as exc:  # noqa: BLE001 — report, but still shut down
+            # A radio that will not close is a leaked serial port or HCI socket:
+            # the next run fails with a bare "device busy" and nothing connects
+            # it to this shutdown. Record it where the user can see it rather
+            # than discarding it, but keep tearing the rest down.
+            self.backend_status = BackendStatus("error", f"Backend did not stop cleanly: {exc}")
+            self._broadcast("backend_status", {"status": self.backend_status.to_dict()})
         for task in self._tasks:
             task.cancel()
-        for task in self._tasks:
-            # A task may have already died with a non-cancel error; awaiting it
-            # re-raises, which must not abort the final flush below.
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        # gather(return_exceptions=True) rather than suppressing around each
+        # await: a task may have already died with a non-cancel error, and
+        # swallowing CancelledError in a `with` block here would also eat a
+        # cancellation aimed at stop() itself, so an outer shutdown that expects
+        # it to propagate would hang instead.
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         # Best-effort final persistence — never let a store error prevent the
         # session from being closed cleanly.
@@ -258,11 +276,15 @@ class Hub:
             self._apply_label(device)
             with self._lock:
                 self.devices[key] = device
-            self._address_index[adv.address] = key
+            self._index_device(device)
             self.stats.devices_seen += 1
         elif adv.address not in self._address_index:
             self._address_index[adv.address] = key
-        device.observe(parsed)
+        # observe() appends to rssi_history and updates the Counters that
+        # to_dict()/exposure() walk from the API threadpool, so the mutation has
+        # to happen under the same lock the readers take.
+        with self._lock:
+            device.observe(parsed)
         self._dirty.add(key)
 
         row = self._feed_row(device, parsed)
@@ -272,7 +294,8 @@ class Hub:
         if self.persist and self.session_id is not None:
             self._pending_observations.append((key, adv))
             if len(self._pending_observations) >= 250:
-                self._flush()
+                # On the event loop: never wait on the store lock here.
+                self._flush(blocking=False)
 
     def _on_link_event(self, event: LinkEvent) -> None:
         self.stats.link_events += 1
@@ -340,17 +363,70 @@ class Hub:
             "tags": sorted({t for d in decodings for t in d.tags}),
         }
 
-    def _flush(self) -> None:
+    def _flush(self, blocking: bool = True) -> None:
+        """Write buffered rows out.
+
+        With ``blocking=False`` — the per-packet path, which runs on the event
+        loop — rows that cannot be written right now are kept for the next
+        attempt rather than parking the loop behind whatever else holds the
+        store lock (a VACUUM from /api/purge, a retention pass in the sweep
+        thread). The buffer is capped so a store that stays busy costs bounded
+        memory instead of growing at packet rate.
+        """
         if self.store is None or self.session_id is None:
             self._pending_observations.clear()
             self._pending_link_events.clear()
             return
         if self._pending_observations:
-            self.store.record_observations(self.session_id, self._pending_observations)
-            self._pending_observations = []
+            if self.store.record_observations(
+                self.session_id, self._pending_observations, blocking=blocking
+            ):
+                self._pending_observations = []
+            else:
+                del self._pending_observations[:-MAX_PENDING_OBSERVATIONS]
         if self._pending_link_events:
-            self.store.record_link_events(self.session_id, self._pending_link_events)
-            self._pending_link_events = []
+            if self.store.record_link_events(
+                self.session_id, self._pending_link_events, blocking=blocking
+            ):
+                self._pending_link_events = []
+            else:
+                del self._pending_link_events[:-MAX_PENDING_OBSERVATIONS]
+
+    def _persist_sweep(
+        self,
+        store: Store,
+        session_id: int,
+        devices: list[Device],
+        pending_obs: list[tuple[str, Advertisement]],
+        pending_links: list[tuple[str | None, LinkEvent]],
+        sweeps: int,
+    ) -> None:
+        """The sweep's storage work, run in a thread.
+
+        Device serialization happens under the hub lock (the capture task is
+        mutating those objects on the loop), but the lock is released before any
+        SQLite call so a slow write never blocks ingest.
+        """
+        with self._lock:
+            rows = store.device_rows(session_id, devices)
+        try:
+            if pending_obs:
+                store.record_observations(session_id, pending_obs)
+            if pending_links:
+                store.record_link_events(session_id, pending_links)
+        except Exception:
+            # Hand the rows back so a transient store error costs a delay, not
+            # the packets. The buffers are capped in _flush.
+            self._pending_observations[:0] = pending_obs
+            self._pending_link_events[:0] = pending_links
+            raise
+        store.snapshot_rows(rows)
+        # Enforce the documented retention window. Without this the observations
+        # table grows at packet rate forever and the "bounded by default"
+        # promise is dead code. The live session is excluded: ageing it out
+        # would cascade away the running capture's own rows.
+        if sweeps % RETENTION_EVERY_SWEEPS == 0:
+            store.enforce_retention(exclude_session=session_id)
 
     # -- periodic work -----------------------------------------------------
 
@@ -374,17 +450,31 @@ class Hub:
             await asyncio.sleep(10.0)
             try:
                 self._sweeps += 1
-                self._flush()
                 self._correlate()
                 self._retire()
                 self._refresh_alerts()
-                if self.store is not None and self.session_id is not None:
-                    self.store.snapshot_devices(self.session_id, list(self.devices.values()))
-                    # Enforce the documented retention window. Without this the
-                    # observations table grows at packet rate forever and the
-                    # "bounded by default" promise is dead code.
-                    if self._sweeps % RETENTION_EVERY_SWEEPS == 0:
-                        self.store.enforce_retention()
+                # Everything below touches SQLite, which serializes on a lock
+                # held across multi-second DELETEs and VACUUMs. Run it in a
+                # thread: on a Pi with a large database the retention pass alone
+                # blocks for seconds, and on the event loop that stalls ingest
+                # (dropping packets at the queue) and every websocket.
+                store, session_id = self.store, self.session_id
+                if store is not None and session_id is not None:
+                    devices = self.device_list()
+                    pending_obs, self._pending_observations = self._pending_observations, []
+                    pending_links, self._pending_link_events = self._pending_link_events, []
+                    sweeps = self._sweeps
+                    await asyncio.to_thread(
+                        self._persist_sweep,
+                        store,
+                        session_id,
+                        devices,
+                        pending_obs,
+                        pending_links,
+                        sweeps,
+                    )
+                else:
+                    self._flush()
                 self.stats.dropped = getattr(self.backend, "dropped", 0)
                 self._broadcast("snapshot", self.snapshot())
             except asyncio.CancelledError:
@@ -412,7 +502,35 @@ class Hub:
             self._rebuild_address_index()
             for key in removed:
                 self._reapply_labels_for(key)
+                self._remap_acknowledged(key)
             self._broadcast("merged", {"removed": sorted(removed), "links": len(links)})
+
+    def _remap_acknowledged(self, absorbed_key: str) -> None:
+        """Carry alert dismissals onto the surviving key after a merge.
+
+        Alert keys embed the device key ("separated:AA:BB:.."), and a merge
+        keeps the elder's key. Without this the alert the user just dismissed is
+        re-raised under the survivor's key on the very next sweep, and keeps
+        coming back every ten seconds.
+        """
+        survivor_key = self._address_index.get(absorbed_key)
+        if not survivor_key or survivor_key == absorbed_key:
+            return
+        for alert_key, level in list(self._acknowledged.items()):
+            prefix, sep, device_key = alert_key.partition(":")
+            if sep and device_key == absorbed_key:
+                self._acknowledged.setdefault(f"{prefix}:{survivor_key}", level)
+
+    def _index_device(self, device: Device) -> None:
+        """Register every address this device is known by.
+
+        ``_retire`` removes entries by walking ``addresses_seen``, so inserting
+        only the currently observed address would leave rows behind pointing at
+        a retired device — and a rotated address would then quietly start a new
+        record instead of resolving to its cluster.
+        """
+        for addr in device.addresses_seen or [device.address]:
+            self._address_index[addr] = device.key
 
     def _rebuild_address_index(self) -> None:
         self._address_index = {
@@ -459,10 +577,29 @@ class Hub:
         alerts = evaluate_all(list(self.devices.values()), session_counts=counts)
         # evaluate_all builds fresh Alert objects (acknowledged defaults False),
         # so re-apply the user's dismissals or a dismissed alert reappears every
-        # sweep.
+        # sweep. A dismissal only silences the level it was made at: if the same
+        # alert has since escalated — a tag that turns up in a second session is
+        # promoted to ATTENTION — it is raised again, because that escalation is
+        # the signal the tool exists to deliver.
         for alert in alerts:
-            if alert.key in self._acknowledged:
+            dismissed_at = self._acknowledged.get(alert.key)
+            if dismissed_at is None:
+                continue
+            try:
+                still_silenced = alert.level.rank <= AlertLevel(dismissed_at).rank
+            except ValueError:
+                still_silenced = True
+            if still_silenced:
                 alert.acknowledged = True
+            else:
+                del self._acknowledged[alert.key]
+                if self.store is not None:
+                    # record_alerts' upsert deliberately never touches the
+                    # acknowledged column, so the stored dismissal has to be
+                    # cleared explicitly or it would silence this alert again
+                    # on the next restart.
+                    with contextlib.suppress(Exception):
+                        self.store.unacknowledge_alert(alert.key)
         self.alerts = alerts
         if self.store is not None and self.session_id is not None and self.alerts:
             self.store.record_alerts(self.session_id, self.alerts)
@@ -497,32 +634,99 @@ class Hub:
         return device
 
     def acknowledge_alert(self, alert_key: str) -> None:
-        self._acknowledged.add(alert_key)
+        level = AlertLevel.ATTENTION.value
         for alert in self.alerts:
             if alert.key == alert_key:
                 alert.acknowledged = True
+                level = alert.level.value
+        self._acknowledged[alert_key] = level
         if self.store is not None:
-            self.store.acknowledge_alert(alert_key)
+            self.store.acknowledge_alert(alert_key, level)
+
+    def after_purge(self) -> None:
+        """Re-open storage after the user destroyed everything.
+
+        ``Store.purge`` deletes every row of ``sessions``, but ``session_id``
+        still points at the row that is now gone. With foreign keys on, the very
+        next observation insert fails and ``_ingest`` exits — capture dies for
+        the life of the process. Opening a fresh session immediately keeps the
+        running capture writable. The in-memory dismissals go too: leaving them
+        would silence alerts whose stored rows the user just deleted.
+        """
+        self._pending_observations.clear()
+        self._pending_link_events.clear()
+        self._acknowledged.clear()
+        self.session_id = None
+        if self.persist and self.store is not None:
+            self.session_id = self.store.start_session(
+                self.session_name,
+                backend=self.backend.name,
+                capabilities=self.backend.capabilities.to_dict(),
+            )
 
     # -- views -------------------------------------------------------------
 
-    def device_list(self) -> list[Device]:
-        # Materialize under the lock: these reads run in Starlette's threadpool
-        # while the capture task inserts/retires on the event loop, and iterating
-        # a dict being resized raises "dictionary changed size during iteration".
+    @contextlib.contextmanager
+    def reading(self) -> Any:
+        """Hold the device lock across a multi-step read.
+
+        Any caller that runs off the event loop — every sync FastAPI endpoint,
+        which Starlette dispatches to a threadpool — must wrap its whole read in
+        this, not just the container access. Device.to_dict(), exposure() and
+        smoothed_rssi all walk deques and Counters that the capture task mutates
+        per packet, so touching them outside the lock raises "deque mutated
+        during iteration" under load.
+        """
         with self._lock:
-            snapshot = list(self.devices.values())
-        return sorted(snapshot, key=lambda d: -(d.smoothed_rssi or -127))
+            yield
+
+    def device_list(self) -> list[Device]:
+        # Hold the lock across the sort as well as the copy: sorting reads
+        # smoothed_rssi, which walks the rssi_history deque that the capture
+        # task appends to on every packet.
+        with self._lock:
+            return sorted(
+                self.devices.values(), key=lambda d: -(d.smoothed_rssi or -127)
+            )
+
+    def device_dicts(self) -> list[dict[str, Any]]:
+        """Serialize every device, safely, from any thread.
+
+        ``device_list`` hands back live Device objects, and ``to_dict`` iterates
+        deques and Counters that the capture task mutates on the event loop —
+        so serializing outside the lock raises "deque mutated during iteration"
+        several times a minute in a busy room. Every reader that runs off the
+        loop must go through here rather than mapping over ``device_list``.
+        """
+        with self._lock:
+            return [d.to_dict() for d in self.device_list()]
+
+    def backend_view(self) -> dict[str, Any]:
+        """What the clients should believe about the radio.
+
+        ``backend.describe()`` reports the backend's own status, which stays
+        "running" after ``_ingest`` has died — so an error recorded there would
+        be overwritten by the next sweep's snapshot and the dashboard would show
+        a healthy capture that is not capturing. The hub's own status wins.
+        """
+        view = self.backend.describe()
+        if self.backend_status.state == "error":
+            view["status"] = self.backend_status.to_dict()
+            view["running"] = False
+        return view
 
     def snapshot(self, include_feed: bool = False) -> dict[str, Any]:
-        devices = self.device_list()
+        with self._lock:
+            devices = self.device_list()
+            device_dicts = [d.to_dict() for d in devices]
+            summary = describe_room(devices)
         payload: dict[str, Any] = {
-            "devices": [d.to_dict() for d in devices],
+            "devices": device_dicts,
             "stats": self.stats.to_dict(),
             "alerts": [a.to_dict() for a in self.alerts],
-            "summary": describe_room(devices),
+            "summary": summary,
             "exposure": self.exposure_summary(),
-            "backend": self.backend.describe(),
+            "backend": self.backend_view(),
             "session_id": self.session_id,
         }
         if include_feed:
@@ -531,31 +735,55 @@ class Hub:
         return payload
 
     def exposure_summary(self) -> dict[str, Any]:
-        with self._lock:
-            devices = list(self.devices.values())
         scores = []
         bands: dict[str, int] = {}
         reasons: dict[str, int] = {}
-        for d in devices:
-            exposure = d.exposure()
-            scores.append(exposure.score)
-            bands[exposure.band] = bands.get(exposure.band, 0) + 1
-            for reason in exposure.reasons:
-                reasons[reason] = reasons.get(reason, 0) + 1
+        # exposure(), rotates_address and the tags Counter all read live state
+        # the capture task mutates, so the lock has to cover every per-device
+        # read here — not just the copy of the container. Reduce to plain
+        # numbers inside the lock and release before building the payload.
+        totals = dict.fromkeys(
+            (
+                "total",
+                "rotating",
+                "named",
+                "plaintext_content",
+                "trackers",
+                "with_link_data",
+                "encrypted_links",
+                "plaintext_links",
+            ),
+            0,
+        )
+        with self._lock:
+            for d in self.devices.values():
+                exposure = d.exposure()
+                scores.append(exposure.score)
+                bands[exposure.band] = bands.get(exposure.band, 0) + 1
+                for reason in exposure.reasons:
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                totals["total"] += 1
+                totals["rotating"] += 1 if d.rotates_address else 0
+                totals["named"] += 1 if d.names else 0
+                totals["plaintext_content"] += 1 if "plaintext_content" in d.tags else 0
+                totals["trackers"] += 1 if d.is_tracker else 0
+                totals["with_link_data"] += 1 if d.link_event_count else 0
+                totals["encrypted_links"] += 1 if d.encrypted_link_seen else 0
+                totals["plaintext_links"] += 1 if d.plaintext_link_seen else 0
         scores.sort()
         return {
-            "total": len(devices),
+            "total": totals["total"],
             "bands": bands,
-            "rotating": sum(1 for d in devices if d.rotates_address),
-            "stable": sum(1 for d in devices if not d.rotates_address),
-            "named": sum(1 for d in devices if d.names),
-            "plaintext_content": sum(1 for d in devices if "plaintext_content" in d.tags),
-            "trackers": sum(1 for d in devices if d.is_tracker),
+            "rotating": totals["rotating"],
+            "stable": totals["total"] - totals["rotating"],
+            "named": totals["named"],
+            "plaintext_content": totals["plaintext_content"],
+            "trackers": totals["trackers"],
             "median_score": scores[len(scores) // 2] if scores else 0,
             "top_reasons": sorted(reasons.items(), key=lambda kv: -kv[1])[:8],
-            "with_link_data": sum(1 for d in devices if d.link_event_count),
-            "encrypted_links": sum(1 for d in devices if d.encrypted_link_seen),
-            "plaintext_links": sum(1 for d in devices if d.plaintext_link_seen),
+            "with_link_data": totals["with_link_data"],
+            "encrypted_links": totals["encrypted_links"],
+            "plaintext_links": totals["plaintext_links"],
         }
 
     def timeline(self, buckets: int = 60) -> dict[str, Any]:

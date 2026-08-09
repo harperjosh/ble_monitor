@@ -30,6 +30,7 @@ import asyncio
 import platform
 import struct
 import time
+from typing import Any
 
 from blemon.capture.base import BackendStatus, CaptureError, QueueBackend, register
 from blemon.models import AddressType, Advertisement, Capabilities, PduType, classify_address
@@ -148,7 +149,10 @@ class BleakBackend(QueueBackend):
             three_channel_advertising=False,
             coded_phy=False,
             two_m_phy=False,
-            can_transmit=False,
+            # Active scanning transmits SCAN_REQ packets. Reporting False while
+            # the radio is doing that tells a user who picked this tool for
+            # receive-only capture the opposite of what is happening.
+            can_transmit=self._scan_mode == "active",
             channel_reporting=False,
             caveats=caveats,
         )
@@ -275,17 +279,43 @@ def _resolve_address_type(device: object, address: str, is_macos: bool) -> Addre
     and invert the entire privacy verdict. When the type is genuinely unknown we
     return UNKNOWN rather than guessing, so an unknowable device is not fed into
     rotation-correlation or scored as if it were deliberately private.
+
+    ``details`` is platform-shaped: BlueZ gives a dict with a "props" mapping,
+    WinRT gives a raw advertisement object and Android a platform object. Read
+    the declaration wherever it lives rather than only from the BlueZ shape —
+    matching just that one silently returns UNKNOWN for every device on every
+    other platform, which quietly disables address-type privacy scoring instead
+    of failing visibly.
     """
     if is_macos:
         return AddressType.OPAQUE
-    details = getattr(device, "details", None)
-    props = details.get("props", {}) if isinstance(details, dict) else {}
-    declared = str(props.get("AddressType", "")).lower() if isinstance(props, dict) else ""
+    declared = _declared_address_type(getattr(device, "details", None))
     if declared == "public":
         return AddressType.PUBLIC
     if declared == "random":
         return classify_address(address, random=True)
     return AddressType.UNKNOWN
+
+
+def _declared_address_type(details: object) -> str:
+    """The OS's own word for the address type, from any backend's details shape."""
+    if details is None:
+        return ""
+    props: Any = details
+    if isinstance(details, dict):
+        props = details.get("props", details)
+    if isinstance(props, dict):
+        for key in ("AddressType", "address_type", "BluetoothAddressType"):
+            if key in props:
+                return str(props[key]).lower()
+        return ""
+    # WinRT / Android expose it as an attribute on a platform object, and WinRT
+    # spells the value "Public"/"Random"/"Unspecified".
+    for key in ("address_type", "AddressType", "BluetoothAddressType"):
+        value = getattr(props, key, None)
+        if value is not None:
+            return str(getattr(value, "name", value)).lower()
+    return ""
 
 
 register("bleak", BleakBackend, priority=40)

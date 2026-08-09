@@ -24,7 +24,13 @@ from typing import Any
 from blemon.device import Device
 from blemon.models import AddressType, Advertisement, LinkEvent, PduType
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: Columns added after v1. ``CREATE TABLE IF NOT EXISTS`` silently does nothing
+#: on a database that already exists, so new columns have to be added by hand.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("alerts", "acknowledged_level", "TEXT"),
+)
 
 #: Keep raw per-packet observations for this long by default. Device summaries
 #: are far smaller and are kept longer.
@@ -84,6 +90,12 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id, ts);
 CREATE INDEX IF NOT EXISTS idx_obs_device  ON observations(device_key, ts);
+-- replay() pages through one session in insertion order with keyset pagination
+-- on the primary key. Without a (session_id, id) index SQLite can only use the
+-- (session_id, ts) index for the equality and then sorts every remaining row of
+-- the session into a temp B-tree on each batch, which is quadratic in the rows
+-- scanned and far slower than the LIMIT/OFFSET-on-ts scan it replaced.
+CREATE INDEX IF NOT EXISTS idx_obs_session_id ON observations(session_id, id);
 -- Retention deletes by timestamp across all sessions; without a ts-leading
 -- index that DELETE would full-scan the whole table.
 CREATE INDEX IF NOT EXISTS idx_obs_ts      ON observations(ts);
@@ -121,7 +133,12 @@ CREATE TABLE IF NOT EXISTS alerts (
     explanation  TEXT,
     evidence     TEXT,
     raised_at    REAL NOT NULL,
-    acknowledged INTEGER NOT NULL DEFAULT 0
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    -- The level the alert had when the user dismissed it. A dismissal silences
+    -- that level and below; if the same alert later escalates (an "info" tracker
+    -- that becomes "attention" because it turned up in a second session) it is
+    -- raised again rather than staying suppressed forever.
+    acknowledged_level TEXT
 );
 """
 
@@ -165,11 +182,25 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._add_missing_columns()
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
             self._conn.commit()
+
+    def _add_missing_columns(self) -> None:
+        """Bring a database created by an older version up to date.
+
+        Only additive, nullable columns live here, so this stays a no-op on a
+        fresh database and never rewrites existing rows.
+        """
+        for table, column, decl in _ADDED_COLUMNS:
+            existing = {
+                r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         with self._lock:
@@ -246,11 +277,17 @@ class Store:
     # -- writes ------------------------------------------------------------
 
     def record_observations(
-        self, session_id: int, rows: list[tuple[str, Advertisement]]
-    ) -> None:
-        """Bulk-insert advertisements. ``rows`` is ``(device_key, advertisement)``."""
+        self, session_id: int, rows: list[tuple[str, Advertisement]], blocking: bool = True
+    ) -> bool:
+        """Bulk-insert advertisements. ``rows`` is ``(device_key, advertisement)``.
+
+        Returns whether the rows were written. With ``blocking=False`` this
+        gives up immediately rather than waiting on the store lock, so a caller
+        on the event loop is never parked behind a long VACUUM or retention
+        sweep running in another thread; it keeps its rows and retries later.
+        """
         if not rows:
-            return
+            return True
         payload = [
             (
                 session_id,
@@ -268,7 +305,9 @@ class Store:
             )
             for key, adv in rows
         ]
-        with self._lock:
+        if not self._lock.acquire(blocking=blocking):
+            return False
+        try:
             self._conn.executemany(
                 """INSERT INTO observations
                    (session_id, device_key, address, address_type, ts, rssi, channel,
@@ -277,10 +316,19 @@ class Store:
                 payload,
             )
             self._conn.commit()
+        finally:
+            self._lock.release()
+        return True
 
-    def record_link_events(self, session_id: int, events: list[tuple[str | None, LinkEvent]]) -> None:
+    def record_link_events(
+        self,
+        session_id: int,
+        events: list[tuple[str | None, LinkEvent]],
+        blocking: bool = True,
+    ) -> bool:
+        """Bulk-insert link events. See ``record_observations`` for ``blocking``."""
         if not events:
-            return
+            return True
         payload = [
             (
                 session_id,
@@ -295,7 +343,9 @@ class Store:
             )
             for key, e in events
         ]
-        with self._lock:
+        if not self._lock.acquire(blocking=blocking):
+            return False
+        try:
             self._conn.executemany(
                 """INSERT INTO link_events
                    (session_id, device_key, ts, kind, direction, encrypted, summary, detail, raw)
@@ -303,12 +353,23 @@ class Store:
                 payload,
             )
             self._conn.commit()
+        finally:
+            self._lock.release()
+        return True
 
     def snapshot_devices(self, session_id: int, devices: list[Device]) -> None:
         """Upsert the current per-device summary for this session."""
-        if not devices:
-            return
-        payload = []
+        self.snapshot_rows(self.device_rows(session_id, devices))
+
+    @staticmethod
+    def device_rows(session_id: int, devices: list[Device]) -> list[tuple]:
+        """Serialize devices into snapshot rows.
+
+        Split out from the write so a caller that has to hold a lock over the
+        live Device objects — the hub, whose capture task mutates them — can do
+        the serialization under that lock and release it before touching SQLite.
+        """
+        payload: list[tuple] = []
         for d in devices:
             exposure = d.exposure()
             payload.append(
@@ -327,6 +388,12 @@ class Store:
                     json.dumps(d.to_dict(), default=str),
                 )
             )
+        return payload
+
+    def snapshot_rows(self, payload: list[tuple]) -> None:
+        """Write rows built by ``device_rows``."""
+        if not payload:
+            return
         with self._lock:
             self._conn.executemany(
                 """INSERT INTO devices
@@ -377,9 +444,26 @@ class Store:
             )
             self._conn.commit()
 
-    def acknowledge_alert(self, key: str) -> None:
+    def acknowledge_alert(self, key: str, level: str | None = None) -> None:
+        """Dismiss an alert, remembering the level it was dismissed at.
+
+        Recording the level is what lets a later escalation of the same alert
+        re-raise instead of being silenced by a months-old dismissal.
+        """
         with self._lock:
-            self._conn.execute("UPDATE alerts SET acknowledged=1 WHERE key=?", (key,))
+            self._conn.execute(
+                "UPDATE alerts SET acknowledged=1, acknowledged_level=? WHERE key=?",
+                (level, key),
+            )
+            self._conn.commit()
+
+    def unacknowledge_alert(self, key: str) -> None:
+        """Undo a dismissal, so an escalated alert is raised again."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE alerts SET acknowledged=0, acknowledged_level=NULL WHERE key=?",
+                (key,),
+            )
             self._conn.commit()
 
     # -- labels ------------------------------------------------------------
@@ -475,6 +559,21 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def last_address_type(self, address: str) -> str | None:
+        """The most recently recorded address type for an address, if any.
+
+        Lets the CLI aim a sniffer as accurately as the dashboard, which reads
+        the type off the live device record.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT address_type FROM observations
+                   WHERE address=? AND address_type IS NOT NULL
+                   ORDER BY ts DESC LIMIT 1""",
+                (address.upper(),),
+            ).fetchone()
+        return row["address_type"] if row else None
+
     def session_counts_for_devices(self, keys: list[str]) -> dict[str, int]:
         """How many distinct sessions each key has appeared in.
 
@@ -528,6 +627,11 @@ class Store:
         quadratic over a multi-million-row session and stalls both live replay
         and PCAP export. ``id`` is autoincrement, so within one session it is
         already in capture order.
+
+        This depends on ``idx_obs_session_id``. Ordering by a column the chosen
+        index does not cover makes SQLite sort every remaining row of the
+        session on each batch, which is slower than the OFFSET scan it replaces
+        — so the index and this query have to change together.
         """
         after = 0
         while True:
@@ -641,8 +745,20 @@ class Store:
             ),
         }
 
-    def enforce_retention(self, now: float | None = None) -> dict[str, int]:
-        """Delete anything past the retention policy. Safe to call frequently."""
+    def enforce_retention(
+        self, now: float | None = None, exclude_session: int | None = None
+    ) -> dict[str, int]:
+        """Delete anything past the retention policy. Safe to call frequently.
+
+        ``exclude_session`` protects a session that is still being written to.
+        Sessions cascade to observations, devices, link events and alerts, so
+        ageing out the *live* session would wipe the running capture's data and
+        leave every subsequent insert failing the foreign key. A long-running
+        service is exactly the case where the session outlives the window.
+
+        This does real work against the whole table, so callers on the event
+        loop should hand it to a thread.
+        """
         now = now or time.time()
         obs_cutoff = now - self.retention.observation_days * 86400
         ses_cutoff = now - self.retention.session_days * 86400
@@ -652,7 +768,15 @@ class Store:
             removed["observations"] = cur.rowcount
             cur = self._conn.execute("DELETE FROM link_events WHERE ts < ?", (obs_cutoff,))
             removed["link_events"] = cur.rowcount
-            cur = self._conn.execute("DELETE FROM sessions WHERE started_at < ?", (ses_cutoff,))
+            if exclude_session is None:
+                cur = self._conn.execute(
+                    "DELETE FROM sessions WHERE started_at < ?", (ses_cutoff,)
+                )
+            else:
+                cur = self._conn.execute(
+                    "DELETE FROM sessions WHERE started_at < ? AND id <> ?",
+                    (ses_cutoff, exclude_session),
+                )
             removed["sessions"] = cur.rowcount
 
             total = int(

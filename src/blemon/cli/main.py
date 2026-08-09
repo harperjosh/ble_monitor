@@ -24,6 +24,7 @@ from blemon import __version__
 from blemon.capture import CaptureError, autoselect, create
 from blemon.cli import render
 from blemon.cli.doctor import FAIL, INFO, OK, WARN, run_doctor
+from blemon.models import AddressType
 from blemon.service import Hub
 from blemon.store import Store, write_pcap
 
@@ -111,6 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_follow = sub.add_parser("follow", help="aim a sniffer at one device's connection")
     radio_args(p_follow)
     p_follow.add_argument("address")
+    p_follow.add_argument(
+        "--address-type",
+        choices=[a.value for a in AddressType],
+        help=(
+            "the target's address type. Sniffer firmware filters on address AND "
+            "type, so a wrong value silently never matches. Looked up from "
+            "previous captures when omitted; defaults to public."
+        ),
+    )
     p_follow.add_argument("--seconds", type=float)
     p_follow.add_argument("--json", action="store_true")
 
@@ -472,7 +482,15 @@ async def cmd_follow(args: argparse.Namespace, console: Console) -> int:
     except CaptureError as exc:
         return fail(console, exc)
 
-    ok = await backend.follow(args.address)
+    # The firmware filters on address AND type; passing nothing here is what
+    # made `blemon follow` silently never match while the dashboard button
+    # worked on the same device. Prefer what the user said, fall back to what
+    # previous captures recorded for this address.
+    address_type = args.address_type
+    if address_type is None and hub.store is not None:
+        with contextlib.suppress(Exception):
+            address_type = hub.store.last_address_type(args.address)
+    ok = await backend.follow(args.address, address_type=address_type)
     if not ok:
         console.print(f"[red]Could not aim the sniffer at {args.address}.[/]")
         await hub.stop()

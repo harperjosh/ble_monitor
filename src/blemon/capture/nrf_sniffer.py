@@ -286,7 +286,9 @@ class NrfSnifferBackend(QueueBackend):
         )
         self._serial.write(slip_encode(header + payload))
 
-    async def follow(self, address: str, address_type: str | None = None) -> bool:
+    async def follow(
+        self, address: str, address_type: AddressType | str | None = None
+    ) -> bool:
         if self._serial is None:
             return False
         try:
@@ -297,16 +299,18 @@ class NrfSnifferBackend(QueueBackend):
             return False
         # The firmware filters on address AND address type, so following a
         # public-address peripheral with the type hardcoded to random never
-        # matches. Use the known type; when it is unknown, fall back to the
-        # top-bit classification (a public MAC's bits classify as UNKNOWN, which
-        # we treat as public rather than forcing random).
-        if address_type == "public":
-            type_byte = 0x00
-        elif address_type in ("random_static", "resolvable_private", "non_resolvable_private"):
-            type_byte = 0x01
-        else:
-            type_byte = 0x01 if classify_address(address, True).is_rotating or \
-                classify_address(address, True) is AddressType.RANDOM_STATIC else 0x00
+        # matches.
+        #
+        # Only trust an address type we were actually told. There is no way to
+        # recover it from the address bits: classify_address() answers "given
+        # that this is a random address, which kind is it", so feeding it a
+        # public MAC returns a confident random subtype (3C:9C:0F:.. comes back
+        # non_resolvable_private) and forces exactly the wrong byte. When the
+        # type is unknown, public is the safe default — the address we were
+        # handed is the one the device is currently advertising, and public is
+        # what a non-privacy device uses.
+        kind = AddressType.coerce(address_type)
+        type_byte = 0x00 if kind is None or kind.is_public_like else 0x01
         # addr(6) + addr_type(1) + follow_only_advertisements(1) + follow_only_legacy(1)
         self._send(REQ_FOLLOW, mac + bytes([type_byte, 0x00, 0x00]))
         self._followed = address.upper()

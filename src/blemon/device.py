@@ -154,7 +154,10 @@ class Device:
     user_label: str | None = None
     #: Guesses read directly off the device by an active GATT probe. Stored on
     #: the device (not spliced into ``identification``) so they survive the next
-    #: re-identify tick — the engine's gatt_probe matcher re-emits them.
+    #: re-identify tick — the engine's gatt_probe matcher re-emits them. Carried
+    #: through ``absorb`` and ``to_dict``: a probe costs a deliberate,
+    #: consent-gated transmission and is never re-run automatically, so losing
+    #: it to a MAC-rotation merge or a restart means it is gone for good.
     probe_guesses: list[Any] = field(default_factory=list)
     #: Marked by the user as their own hardware; required for probe allowlist mode.
     is_mine: bool = False
@@ -262,6 +265,8 @@ class Device:
             self.user_label = other.user_label
         if not self.notes and other.notes:
             self.notes = other.notes
+        if not self.probe_guesses and other.probe_guesses:
+            self.probe_guesses = list(other.probe_guesses)
         self.link_event_count += other.link_event_count
         self.encrypted_link_seen = self.encrypted_link_seen or other.encrypted_link_seen
         self.plaintext_link_seen = self.plaintext_link_seen or other.plaintext_link_seen
@@ -445,6 +450,7 @@ class Device:
             "notes": self.notes,
             "sources": sorted(self.sources),
             "identification": self.identification.to_dict() if self.identification else None,
+            "probe_guesses": [g.to_dict() for g in self.probe_guesses],
             "exposure": self.exposure().to_dict(),
             "radar_angle": round(self.radar_angle, 5),
             "stable_hash": self.stable_hash(),

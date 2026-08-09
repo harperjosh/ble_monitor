@@ -31,11 +31,19 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from blemon.capture.base import BackendStatus, CaptureError, QueueBackend, register
 from blemon.capture.llparse import parse_adv_pdu
 from blemon.decode.link import decode_data_pdu
-from blemon.models import Advertisement, Capabilities, LinkEvent, PduType, classify_address
+from blemon.models import (
+    AddressType,
+    Advertisement,
+    Capabilities,
+    LinkEvent,
+    PduType,
+    classify_address,
+)
 
 BLE_ADV_ACCESS_ADDRESS = 0x8E89BED6
 BLE_ADV_CRC_INIT = 0x555555
@@ -134,21 +142,46 @@ def detect_sniffers() -> list[DetectedSniffer]:
     return found
 
 
-def probe_firmware(port: str, baudrate: int = 2_000_000, timeout: float = 0.4) -> str | None:
+class FirmwareProbe(NamedTuple):
+    """The outcome of asking a dongle for its firmware version.
+
+    ``version`` is set only when the dongle actually answered. ``unreachable``
+    distinguishes "could not talk to it at all" — busy, no permission, no
+    pyserial — from "answered nothing", which is the only case that actually
+    suggests the wrong firmware. Collapsing the two is what makes a diagnostic
+    tell someone to reflash working hardware.
+    """
+
+    version: str | None = None
+    unreachable: str = ""
+
+
+def probe_firmware(
+    port: str, baudrate: int = 2_000_000, timeout: float = 0.4
+) -> FirmwareProbe:
     """Best-effort: ask a detected dongle for its Sniffle firmware version.
 
     A device with the right USB identity is not necessarily running Sniffle — a
     factory SONOFF dongle ships with Zigbee firmware and answers nothing. This
     opens the port briefly, sends the version command, and returns the version
-    string if it replies, or None if it stays silent. Always closes the port.
+    string if it replies. Always closes the port.
+
+    The port is opened exclusively: without that this happily opens a tty a
+    running capture already owns, writes a command into its stream and steals
+    bytes from its reader, desynchronising a live capture in order to run a
+    diagnostic on it.
     """
     try:
         import serial
     except ImportError:
-        return None
+        return FirmwareProbe(unreachable="pyserial is not installed")
     ser = None
     try:
-        ser = serial.Serial(port, baudrate, timeout=timeout)
+        try:
+            ser = serial.Serial(port, baudrate, timeout=timeout, exclusive=True)
+        except TypeError:
+            # Non-POSIX pyserial builds do not accept exclusive=.
+            ser = serial.Serial(port, baudrate, timeout=timeout)
         body = bytes([CMD_VERSION])
         frame = base64.b64encode(bytes([(len(body) + 3) // 3]) + body) + b"\r\n"
         ser.write(frame)
@@ -164,10 +197,13 @@ def probe_firmware(port: str, baudrate: int = 2_000_000, timeout: float = 0.4) -
             # A measurement message (type 0x14) carrying a version measurement
             # (subtype 0x00) is the version reply.
             if len(data) >= 3 and data[1] == MSG_MEASUREMENT and data[2] == 0x00:
-                return data[3:].decode("utf-8", errors="replace").strip("\x00").strip() or "present"
-        return None
-    except Exception:
-        return None
+                version = (
+                    data[3:].decode("utf-8", errors="replace").strip("\x00").strip()
+                )
+                return FirmwareProbe(version=version or "present")
+        return FirmwareProbe()
+    except Exception as exc:  # noqa: BLE001 — every failure here is "could not ask"
+        return FirmwareProbe(unreachable=str(exc) or type(exc).__name__)
     finally:
         if ser is not None:
             with contextlib.suppress(Exception):
@@ -401,7 +437,9 @@ class SniffleBackend(QueueBackend):
 
     # -- following ---------------------------------------------------------
 
-    async def follow(self, address: str, address_type: str | None = None) -> bool:
+    async def follow(
+        self, address: str, address_type: AddressType | str | None = None
+    ) -> bool:
         # Sniffle filters connection-follow on the 6 MAC bytes alone, so the
         # address type is accepted for interface parity but not needed here.
         del address_type

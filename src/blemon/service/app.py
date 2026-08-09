@@ -19,9 +19,15 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
-from starlette.concurrency import run_in_threadpool
 
 from blemon import __version__
 from blemon.capture.probe import PROBE_WARNING, is_allowed, probe
@@ -66,6 +72,38 @@ PLACEHOLDER_PAGE = """<!doctype html>
 """
 
 
+def _building(
+    d: Any, exposure: Any, max_rate: float, max_duration: float
+) -> dict[str, Any]:
+    """One city building. Call with the device's exposure already computed."""
+    return {
+        "key": d.key,
+        "label": d.display_name,
+        "category": d.category.value,
+        "district": d.category.value,
+        "vendor": (d.company_names[0] if d.company_names else None),
+        # Deterministic lot: the same device lands in the same place every
+        # session, so a place has a recognisable skyline.
+        "lot": d.stable_hash(),
+        # sqrt so a moderately chatty device is still a visible tower rather
+        # than a stub — matches the dashboard's own scaling.
+        "height": round(min(1.0, (d.advertising_rate / max_rate) ** 0.5), 4),
+        "footprint": round(0.42 + 0.5 * min(1.0, d.duration / max_duration), 4),
+        "proximity": d.proximity.value,
+        "rssi": d.smoothed_rssi,
+        "lit": time.time() - d.last_seen < 5.0,
+        "last_seen": d.last_seen,
+        # Glass = broadcasting in the clear, opaque = shuttered. The rule lives
+        # on Exposure so this and the dashboard agree.
+        "material": exposure.material,
+        "exposure": exposure.score,
+        "is_tracker": d.is_tracker,
+        "rotating": d.rotates_address,
+        "packet_count": d.packet_count,
+        "advertising_rate": round(d.advertising_rate, 2),
+    }
+
+
 def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) -> FastAPI:
     app = FastAPI(
         title="ble-monitor",
@@ -87,7 +125,7 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
             "version": __version__,
             "now": time.time(),
             "stats": hub.stats.to_dict(),
-            "backend": hub.backend.describe(),
+            "backend": hub.backend_view(),
             "backend_status": hub.backend_status.to_dict(),
             "session_id": hub.session_id,
             "device_count": len(hub.devices),
@@ -121,31 +159,33 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
         min_rssi: int | None = None,
     ) -> dict[str, Any]:
         out = []
-        for device in hub.device_list():
-            if category and device.category.value != category:
-                continue
-            if tracker_only and not device.is_tracker:
-                continue
-            if min_rssi is not None and (device.smoothed_rssi or -127) < min_rssi:
-                continue
-            if search:
-                needle = search.lower()
-                haystack = " ".join(
-                    [device.display_name, device.address, *device.names, *device.service_uuids]
-                ).lower()
-                if needle not in haystack:
+        with hub.reading():
+            for device in hub.device_list():
+                if category and device.category.value != category:
                     continue
-            out.append(device.to_dict())
+                if tracker_only and not device.is_tracker:
+                    continue
+                if min_rssi is not None and (device.smoothed_rssi or -127) < min_rssi:
+                    continue
+                if search:
+                    needle = search.lower()
+                    haystack = " ".join(
+                        [device.display_name, device.address, *device.names, *device.service_uuids]
+                    ).lower()
+                    if needle not in haystack:
+                        continue
+                out.append(device.to_dict())
         return {"devices": out, "count": len(out), "summary": hub.snapshot()["summary"]}
 
     @app.get("/api/devices/{key}")
     def device_detail(key: str) -> dict[str, Any]:
-        device = hub.devices.get(key)
-        if device is None:
-            raise HTTPException(404, f"No live device with key {key!r}")
-        payload = device.to_dict(include_decode=True)
-        payload["english"] = describe_device(device)
-        payload["continuity_note"] = explain_absence(device)
+        with hub.reading():
+            device = hub.devices.get(key)
+            if device is None:
+                raise HTTPException(404, f"No live device with key {key!r}")
+            payload = device.to_dict(include_decode=True)
+            payload["english"] = describe_device(device)
+            payload["continuity_note"] = explain_absence(device)
         if hub.store is not None:
             payload["history"] = hub.store.device_history(key)
             payload["link_events"] = (
@@ -170,9 +210,8 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
 
     @app.get("/api/radar")
     def radar() -> dict[str, Any]:
-        devices = hub.device_list()
-        return {
-            "devices": [
+        with hub.reading():
+            blips = [
                 {
                     "key": d.key,
                     "label": d.display_name,
@@ -188,8 +227,10 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
                     "first_seen": d.first_seen,
                     "is_guess": d.user_label is None,
                 }
-                for d in devices
-            ],
+                for d in hub.device_list()
+            ]
+        return {
+            "devices": blips,
             "honesty": {
                 "angle": (
                     "Bluetooth gives no direction information whatsoever. Each device's "
@@ -206,39 +247,17 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
 
     @app.get("/api/city")
     def city() -> dict[str, Any]:
-        devices = hub.device_list()
-        max_rate = max((d.advertising_rate for d in devices), default=1.0) or 1.0
-        max_duration = max((d.duration for d in devices), default=1.0) or 1.0
+        with hub.reading():
+            devices = hub.device_list()
+            max_rate = max((d.advertising_rate for d in devices), default=1.0) or 1.0
+            max_duration = max((d.duration for d in devices), default=1.0) or 1.0
+            # Bind the exposure once per device: it is recomputed from scratch on
+            # every call, walking every signal and allocating two reason lists.
+            buildings = [
+                _building(d, d.exposure(), max_rate, max_duration) for d in devices
+            ]
         return {
-            "buildings": [
-                {
-                    "key": d.key,
-                    "label": d.display_name,
-                    "category": d.category.value,
-                    "district": d.category.value,
-                    "vendor": (d.company_names[0] if d.company_names else None),
-                    # Deterministic lot: the same device lands in the same place
-                    # every session, so a place has a recognisable skyline.
-                    "lot": d.stable_hash(),
-                    # sqrt so a moderately chatty device is still a visible tower
-                    # rather than a stub — matches the dashboard's own scaling.
-                    "height": round(min(1.0, (d.advertising_rate / max_rate) ** 0.5), 4),
-                    "footprint": round(0.42 + 0.5 * min(1.0, d.duration / max_duration), 4),
-                    "proximity": d.proximity.value,
-                    "rssi": d.smoothed_rssi,
-                    "lit": time.time() - d.last_seen < 5.0,
-                    "last_seen": d.last_seen,
-                    # Glass = broadcasting in the clear, opaque = shuttered. The
-                    # rule lives on Exposure so this and the dashboard agree.
-                    "material": d.exposure().material,
-                    "exposure": d.exposure().score,
-                    "is_tracker": d.is_tracker,
-                    "rotating": d.rotates_address,
-                    "packet_count": d.packet_count,
-                    "advertising_rate": round(d.advertising_rate, 2),
-                }
-                for d in devices
-            ],
+            "buildings": buildings,
             "legend": {
                 "height": "advertising rate — chatty devices are skyscrapers",
                 "footprint": "how long it has been observed — persistent devices become landmarks",
@@ -265,15 +284,18 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
     @app.get("/api/exposure")
     def exposure() -> dict[str, Any]:
         summary = hub.exposure_summary()
-        summary["devices"] = [
-            {
-                "key": d.key,
-                "label": d.display_name,
-                "category": d.category.value,
-                **d.exposure().to_dict(),
-            }
-            for d in sorted(hub.device_list(), key=lambda x: -x.exposure().score)
-        ]
+        with hub.reading():
+            # One exposure() per device, not three (two in the sort key plus one
+            # in the body) — it is recomputed from scratch on every call.
+            scored = [
+                (
+                    d.exposure(),
+                    {"key": d.key, "label": d.display_name, "category": d.category.value},
+                )
+                for d in hub.device_list()
+            ]
+        scored.sort(key=lambda pair: -pair[0].score)
+        summary["devices"] = [{**meta, **exposure.to_dict()} for exposure, meta in scored]
         return summary
 
     @app.get("/api/alerts")
@@ -301,8 +323,9 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
                 "This capture backend cannot follow connections. That needs sniffer "
                 "hardware — see the capability panel.",
             )
-        address_type = device.address_type.value if device else None
-        ok = await hub.backend.follow(address, address_type=address_type)
+        ok = await hub.backend.follow(
+            address, address_type=device.address_type if device else None
+        )
         return {
             "ok": ok,
             "address": address,
@@ -354,8 +377,11 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
             "enabled": app.state.allow_probe,
             "allowlist_only": app.state.allowlist_only,
             "warning": PROBE_WARNING,
+            # Sync endpoint: this runs in Starlette's threadpool while the
+            # capture task inserts and retires devices on the event loop, so the
+            # iteration has to be guarded.
             "allowlisted": sorted(
-                {d.address for d in hub.devices.values() if d.is_mine}
+                {d.address for d in hub.device_list() if d.is_mine}
             ),
         }
 
@@ -382,13 +408,19 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
             body = await request.json()
         # purge() runs a full DELETE + VACUUM; run it off the event loop so it
         # does not freeze capture and every websocket for the rewrite's duration.
+        # The capture path tolerates the store being busy meanwhile — its flush
+        # never waits on the store lock.
         await run_in_threadpool(hub.store.purge, keep_labels=body.get("keep_labels", True))
+        # purge deletes every session row, including the one this capture is
+        # writing to. Without a fresh session the next insert fails the foreign
+        # key and takes the ingest loop down with it.
+        hub.after_purge()
         stored = await run_in_threadpool(hub.store.what_is_stored)
-        return {"ok": True, "stored": stored}
+        return {"ok": True, "stored": stored, "session_id": hub.session_id}
 
     @app.get("/api/export/devices.json")
     def export_devices_json(redact: bool = False) -> Response:
-        rows = [{"snapshot": d.to_dict()} for d in hub.device_list()]
+        rows = [{"snapshot": d} for d in hub.device_dicts()]
         return Response(
             devices_to_json(rows, redact=redact, metadata={"backend": hub.backend.name}),
             media_type="application/json",
@@ -397,7 +429,7 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
 
     @app.get("/api/export/devices.csv")
     def export_devices_csv(redact: bool = False) -> Response:
-        rows = [{"snapshot": d.to_dict()} for d in hub.device_list()]
+        rows = [{"snapshot": d} for d in hub.device_dicts()]
         return PlainTextResponse(
             devices_to_csv(rows, redact=redact),
             media_type="text/csv",
@@ -453,8 +485,8 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
 
         assets_root = assets.resolve()
 
-        @app.get("/{path:path}", response_class=HTMLResponse)
-        def spa(path: str) -> HTMLResponse:
+        @app.get("/{path:path}")
+        def spa(path: str) -> Response:
             # Single-page app: unknown paths render the shell, not a 404.
             if path.startswith("api/"):
                 return JSONResponse({"detail": "Not found"}, status_code=404)
@@ -462,12 +494,18 @@ def create_app(hub: Hub, allow_probe: bool = True, allowlist_only: bool = True) 
             # the web asset directory. Without this containment check, a path
             # like "../../../../etc/passwd" escapes the bundle and turns the
             # catch-all into remote arbitrary-file read — remotely reachable
-            # under the shipped `--host 0.0.0.0` deployment.
+            # under the shipped `--host 0.0.0.0` deployment. An absolute path
+            # makes the join discard assets_root entirely, so the containment
+            # check — not the join — is what has to hold.
             if path:
                 candidate = (assets_root / path).resolve()
                 if candidate.is_relative_to(assets_root) and candidate.is_file():
-                    return HTMLResponse(candidate.read_text(encoding="utf-8"))
-            return HTMLResponse((assets_root / "index.html").read_text(encoding="utf-8"))
+                    # FileResponse, not HTMLResponse: a root-level favicon.ico,
+                    # manifest or service worker is not HTML, and read_text on a
+                    # binary asset raises UnicodeDecodeError. Let Starlette pick
+                    # the content type from the suffix.
+                    return FileResponse(candidate)
+            return FileResponse(assets_root / "index.html", media_type="text/html")
     else:
 
         @app.get("/", response_class=HTMLResponse)
