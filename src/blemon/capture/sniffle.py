@@ -71,6 +71,22 @@ MSG_MARKER = 0x12
 MSG_STATE = 0x13
 MSG_MEASUREMENT = 0x14
 
+#: Every message type the sniffer can send. Nothing else is Sniffle framing,
+#: which is what lets a run of these stand in as proof the firmware is running.
+SNIFFER_MESSAGE_TYPES = frozenset(
+    {MSG_PACKET, MSG_DEBUG, MSG_MARKER, MSG_STATE, MSG_MEASUREMENT}
+)
+
+# Measurement sub-types, which are what a MSG_MEASUREMENT body is discriminated
+# on. Only the version one is acted on here; the rest are named so the reader
+# can see that 0x05 is one of six and not a lucky constant.
+MEAS_INTERVAL = 0x00
+MEAS_CHANMAP = 0x01
+MEAS_ADVHOP = 0x02
+MEAS_WINOFFSET = 0x03
+MEAS_DELTAINSTANT = 0x04
+MEAS_VERSION = 0x05
+
 PHY_1M, PHY_2M, PHY_CODED_S8, PHY_CODED_S2 = 0, 1, 2, 3
 PHY_NAMES = {0: "1M", 1: "2M", 2: "Coded", 3: "Coded"}
 
@@ -166,6 +182,31 @@ def detect_sniffers() -> list[DetectedSniffer]:
     return found
 
 
+def parse_version_measurement(body: bytes) -> str | None:
+    """Read a firmware version out of a MSG_MEASUREMENT body, or None.
+
+    The body is ``[length][measurement type][payload...]``, where ``length``
+    counts every byte after itself. Both leading bytes matter: reading the
+    length byte as the sub-type is what made a correctly flashed dongle look
+    unflashed, because a version measurement's length is 5 and its sub-type is
+    also 5, so a test for sub-type 0 at the length's offset can never match.
+
+    The version payload is four bytes — major, minor, revision, API level — not
+    a string. The API level tracks host/firmware protocol compatibility rather
+    than the release, and is 0 on the builds this has been tested against, so
+    it is deliberately not part of the version reported to the user.
+    """
+    if len(body) < 6 or body[1] != MEAS_VERSION:
+        return None
+    # The same length check Sniffle's own client makes. Here it does double
+    # duty: it also keeps a line of noise that happened to base64-decode from
+    # being announced as a firmware version.
+    if body[0] != len(body) - 1:
+        return None
+    major, minor, revision = body[2:5]
+    return f"{major}.{minor}.{revision}"
+
+
 class FirmwareProbe(NamedTuple):
     """The outcome of asking a dongle for its firmware version.
 
@@ -174,13 +215,33 @@ class FirmwareProbe(NamedTuple):
     pyserial — from "answered nothing", which is the only case that actually
     suggests the wrong firmware. Collapsing the two is what makes a diagnostic
     tell someone to reflash working hardware.
+
+    ``sniffle_traffic`` is the second, independent line of evidence: a dongle
+    emitting well-formed Sniffle messages is running Sniffle whether or not it
+    answers a version query, and unlike a version reply it cannot be faked by a
+    single lucky decode. It is what keeps "did not answer" from being read as
+    "not flashed" when the sniffer is plainly working.
     """
 
     version: str | None = None
     unreachable: str = ""
-    #: The UART rate that produced this answer. Set when ``version`` is, so a
-    #: caller that had to search for the rate can go on to use it.
+    #: The UART rate that produced this answer. Set whenever the dongle was
+    #: heard from at all, so a caller that had to search for the rate can go on
+    #: to use it.
     baudrate: int | None = None
+    #: Well-formed Sniffle messages were seen on the wire.
+    sniffle_traffic: bool = False
+
+    @property
+    def is_sniffle(self) -> bool:
+        """Whether Sniffle firmware was positively identified, by any evidence."""
+        return self.version is not None or self.sniffle_traffic
+
+
+#: How many well-formed messages count as proof of life. A single one could be
+#: noise at the wrong rate that happened to base64-decode into a plausible type
+#: byte; a run of them could not.
+SNIFFLE_TRAFFIC_THRESHOLD = 3
 
 
 def probe_firmware(
@@ -192,6 +253,12 @@ def probe_firmware(
     factory SONOFF dongle ships with Zigbee firmware and answers nothing. This
     opens the port briefly, sends the version command, and returns the version
     string if it replies. Always closes the port.
+
+    Anything else well-formed that arrives in the same window is recorded as
+    ``sniffle_traffic``. Sniffle starts sniffing the moment it boots, so a
+    working dongle is usually already mid-stream when the port opens, and that
+    stream is the better evidence of the two: the version reply says the
+    firmware parsed one command, the packets say it is doing its job.
 
     The port is opened exclusively: without that this happily opens a tty a
     running capture already owns, writes a command into its stream and steals
@@ -213,21 +280,30 @@ def probe_firmware(
         frame = base64.b64encode(bytes([(len(body) + 3) // 3]) + body) + b"\r\n"
         ser.write(frame)
         deadline = time.monotonic() + timeout
+        framed = 0
         while time.monotonic() < deadline:
             line = ser.readline()
             if not line:
                 continue
             try:
-                data = base64.b64decode(line.rstrip())
+                # Strict: at the wrong rate this is fed pure noise, and the
+                # lenient decoder discards the invalid characters and returns
+                # whatever is left, which is how noise starts looking like a
+                # message.
+                data = base64.b64decode(line.rstrip(), validate=True)
             except Exception:
                 continue
-            # A measurement message (type 0x14) carrying a version measurement
-            # (subtype 0x00) is the version reply.
-            if len(data) >= 3 and data[1] == MSG_MEASUREMENT and data[2] == 0x00:
-                version = (
-                    data[3:].decode("utf-8", errors="replace").strip("\x00").strip()
-                )
-                return FirmwareProbe(version=version or "present", baudrate=baudrate)
+            if len(data) < 2 or data[1] not in SNIFFER_MESSAGE_TYPES:
+                continue
+            framed += 1
+            if data[1] == MSG_MEASUREMENT:
+                version = parse_version_measurement(data[2:])
+                if version is not None:
+                    return FirmwareProbe(
+                        version=version, baudrate=baudrate, sniffle_traffic=True
+                    )
+        if framed >= SNIFFLE_TRAFFIC_THRESHOLD:
+            return FirmwareProbe(baudrate=baudrate, sniffle_traffic=True)
         return FirmwareProbe()
     except Exception as exc:  # noqa: BLE001 — every failure here is "could not ask"
         return FirmwareProbe(unreachable=str(exc) or type(exc).__name__)
@@ -248,18 +324,23 @@ def probe_firmware_any(
     both are silence. Trying every rate Sniffle ships a build for is what keeps
     "you have not flashed this yet" an honest statement rather than a guess.
 
-    Precedence in the reply: a version wins; failing that, a genuine silence
-    (the port opened, nothing came back) outranks unreachability, because
-    "opened it at 2 Mbaud, opened it at 921600, neither answered" really is
-    evidence about the firmware. Only if no rate could be opened at all do we
-    report unreachable, carrying the first reason — the port being busy or
-    unpermitted says nothing about what is flashed on it.
+    The search stops at the first rate the dongle is heard on at all, version
+    reply or not. Sniffle framing only decodes at the rate the UART is actually
+    running, so hearing it settles the question the search exists to answer;
+    carrying on to the other rate could only collect noise.
+
+    Precedence in the reply: identified firmware wins; failing that, a genuine
+    silence (the port opened, nothing came back) outranks unreachability,
+    because "opened it at 2 Mbaud, opened it at 921600, neither answered"
+    really is evidence about the firmware. Only if no rate could be opened at
+    all do we report unreachable, carrying the first reason — the port being
+    busy or unpermitted says nothing about what is flashed on it.
     """
     first_unreachable = ""
     opened_any = False
     for baud in baudrates:
         probe = probe_firmware(port, baud, timeout)
-        if probe.version:
+        if probe.is_sniffle:
             return probe
         if probe.unreachable:
             first_unreachable = first_unreachable or probe.unreachable
@@ -429,8 +510,11 @@ class SniffleBackend(QueueBackend):
         """
         assert self.port is not None
         probe = probe_firmware_any(self.port, candidates)
-        if probe.version and probe.baudrate:
+        if probe.version:
             self._firmware = probe.version
+        # A rate that produced Sniffle framing is the right rate even if the
+        # version query went unanswered, so it is worth adopting on its own.
+        if probe.baudrate:
             return probe.baudrate
         return candidates[0]
 
@@ -609,9 +693,10 @@ class SniffleBackend(QueueBackend):
                     {"sniffer_state": state, "target": self._followed},
                 ),
             )
-        elif msg_type == MSG_MEASUREMENT and body:
-            if body[0] == 0x00 and len(body) > 1:  # version measurement
-                self._firmware = body[1:].decode("utf-8", errors="replace").strip("\x00")
+        elif msg_type == MSG_MEASUREMENT:
+            version = parse_version_measurement(body)
+            if version is not None:
+                self._firmware = version
         elif msg_type == MSG_DEBUG:
             text = body.decode("utf-8", errors="replace").strip()
             if text:

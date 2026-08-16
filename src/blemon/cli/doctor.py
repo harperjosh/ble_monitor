@@ -353,13 +353,24 @@ def _check_sniffers(report: Report) -> None:
             # evidence of anything, and reporting it as such tells someone who
             # just flashed correctly that their flash failed.
             probe = probe_firmware_any(found.port, found.baud_candidates)
+            rate = f" at {probe.baudrate} baud" if probe.baudrate else ""
             if probe.version:
-                rate = f" at {probe.baudrate} baud" if probe.baudrate else ""
                 report.add(
                     OK,
                     f"Sniffle sniffer: {found.description}",
                     f"Responded to a version query{rate} (firmware: {probe.version}). "
                     "This is the backend that can follow connections.",
+                )
+            elif probe.sniffle_traffic:
+                # It is already sniffing, which is what we wanted to know. A
+                # missing version reply is a detail about one command, not
+                # grounds for telling someone their flash failed.
+                report.add(
+                    OK,
+                    f"Sniffle sniffer: {found.description}",
+                    f"Streaming captured packets{rate}, so Sniffle is running, though "
+                    "it did not answer a version query. This is the backend that can "
+                    "follow connections.",
                 )
             elif probe.unreachable:
                 # Could not talk to it at all. That says nothing about the
