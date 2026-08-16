@@ -77,11 +77,26 @@ class Report:
 
 FLASH_SNIFFLE = """Flashing Sniffle firmware:
   1. Download a release from https://github.com/nccgroup/Sniffle/releases
-  2. SONOFF ZBDongle-P: hold BOOT, plug in, then
-       python -m pip install cc2538-bsl
-       cc2538-bsl -p /dev/ttyUSB0 -evw sniffle_cc1352p1_cc2652p1.hex
+     SONOFF ZBDongle-P: take `sniffle_cc1352p1_cc2652p1.hex` — the plain build,
+     not `_1M`, which is for the 2022 batch built with a CP2102 (non-N) bridge.
+     Check its sha256 against the release page: a wrong-chip image can brick the
+     dongle, and this is the last cheap moment to catch one.
+  2. Get the flasher. It is not on PyPI, so clone it and run it in place:
+       git clone https://github.com/JelmerT/cc2538-bsl
+       cd cc2538-bsl && python3 -m venv .venv
+       ./.venv/bin/pip install pyserial intelhex
+  3. Flash. `--bootloader-sonoff-usb` enters the ROM bootloader over the serial
+     control lines, so the aluminium case stays shut — the BOOT button is on the
+     PCB inside it and you do not need to reach it:
+       ./.venv/bin/python -m cc2538_bsl.cc2538_bsl -p <port> \\
+         --bootloader-sonoff-usb -e -w -v sniffle_cc1352p1_cc2652p1.hex
+     <port> is /dev/ttyUSB0 on Linux, /dev/cu.usbserial-XXXX on macOS — `cu`,
+     never `tty`, which blocks waiting for carrier detect and hangs the flash.
+     Expect a mass erase, a ~360KB write, and a CRC32 match. It reports the chip
+     as "CC1350 PG2.1"; that is the ROM bootloader's coarse family ID and is what
+     a CC2652P always says. A verified CRC is the real confirmation.
      TI LaunchPad: use UniFlash, or drag the .hex onto the DAPLink drive.
-  3. Unplug, replug, and run `blemon doctor` again."""
+  4. Unplug, replug, and run `blemon doctor` again."""
 
 FLASH_NRF = """Flashing the Nordic nRF Sniffer:
   1. Download "nRF Sniffer for Bluetooth LE" from nordicsemi.com
@@ -325,7 +340,7 @@ def _check_sniffers(report: Report) -> None:
         return
 
     from blemon.capture.nrf_sniffer import detect_nordic
-    from blemon.capture.sniffle import detect_sniffers, probe_firmware
+    from blemon.capture.sniffle import detect_sniffers, probe_firmware_any
 
     sniffle = detect_sniffers()
     nordic = detect_nordic()
@@ -333,14 +348,18 @@ def _check_sniffers(report: Report) -> None:
     if sniffle:
         for found in sniffle:
             # A device with the right USB identity is not necessarily flashed
-            # with Sniffle — a factory SONOFF ships with Zigbee firmware. Ask it.
-            probe = probe_firmware(found.port, found.baudrate)
+            # with Sniffle — a factory SONOFF ships with Zigbee firmware. Ask it,
+            # at every rate Sniffle ships a build for: silence at one rate is not
+            # evidence of anything, and reporting it as such tells someone who
+            # just flashed correctly that their flash failed.
+            probe = probe_firmware_any(found.port, found.baud_candidates)
             if probe.version:
+                rate = f" at {probe.baudrate} baud" if probe.baudrate else ""
                 report.add(
                     OK,
                     f"Sniffle sniffer: {found.description}",
-                    f"Responded to a version query (firmware: {probe.version}). This is "
-                    "the backend that can follow connections.",
+                    f"Responded to a version query{rate} (firmware: {probe.version}). "
+                    "This is the backend that can follow connections.",
                 )
             elif probe.unreachable:
                 # Could not talk to it at all. That says nothing about the
@@ -357,12 +376,16 @@ def _check_sniffers(report: Report) -> None:
                     "`dialout` group and log back in).",
                 )
             else:
+                rates = ", ".join(str(b) for b in found.baud_candidates)
                 report.add(
                     WARN,
                     f"Sniffle-compatible hardware: {found.description}",
-                    "The USB identity matches, but it did not answer a version query — "
-                    "it is probably not flashed with Sniffle yet (a factory SONOFF "
-                    "dongle ships with Zigbee firmware).",
+                    "The USB identity matches, but it did not answer a version query "
+                    f"at any rate Sniffle uses ({rates}) — it is probably not flashed "
+                    "with Sniffle yet (a factory SONOFF dongle ships with Zigbee "
+                    "firmware). If you have just flashed it, unplug and replug it "
+                    "first; if it still says this, `--baud <rate>` overrides the "
+                    "search.",
                     FLASH_SNIFFLE,
                 )
     if nordic:

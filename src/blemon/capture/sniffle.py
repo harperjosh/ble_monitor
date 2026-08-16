@@ -95,8 +95,23 @@ KNOWN_ADAPTERS: dict[tuple[int, int], str] = {
     (0x2E8A, 0x00C0): "CatSniffer v3",
 }
 
-#: Silicon Labs CP2102 (non-N) tops out below Sniffle's usual 2 Mbaud.
+#: Silicon Labs CP210x bridge PIDs, as used by the SONOFF dongles.
 CP2102_PIDS = {0xEA60, 0xEA61, 0xEA62, 0xEA63}
+
+#: The two UART rates Sniffle ships builds for, fastest first.
+#:
+#: The standard firmware images run the UART at 2 Mbaud. The ``_1M`` images run
+#: it at 921600, and exist for a specific accident of history: during the 2022
+#: chip shortage some SONOFF CC2652P dongles were built with a CP2102 (non-N)
+#: bridge, which cannot go faster. Current production uses the CP2102N, which
+#: can.
+#:
+#: Both variants enumerate with byte-identical USB descriptors, so which one is
+#: in front of us cannot be read off the VID/PID — the only honest way to find
+#: out is to ask the dongle at each rate and see which one answers. Guessing
+#: wrong is not a loud failure: the port opens, the version query goes into the
+#: void, and a correctly flashed sniffer looks like a factory Zigbee dongle.
+SNIFFLE_BAUD_RATES: tuple[int, ...] = (2_000_000, 921_600)
 
 
 @dataclass
@@ -105,7 +120,11 @@ class DetectedSniffer:
     description: str
     vid: int | None
     pid: int | None
+    #: Preferred rate — the first candidate. Kept as a plain int because it is
+    #: what callers wanting a single number expect.
     baudrate: int
+    #: Every rate worth trying on this hardware, in order.
+    baud_candidates: tuple[int, ...] = SNIFFLE_BAUD_RATES
 
 
 def detect_sniffers() -> list[DetectedSniffer]:
@@ -129,14 +148,19 @@ def detect_sniffers() -> list[DetectedSniffer]:
         product = (port.product or "").lower()
         if (vid, pid) == (0x10C4, 0xEA60) and "zigbee" not in product and "sonoff" not in product:
             continue
-        baud = 921600 if (vid == 0x10C4 and pid in CP2102_PIDS) else 2_000_000
+        # A CP210x-bridged dongle may be running either build, so both rates are
+        # worth trying. Everything else is 2 Mbaud only.
+        candidates = (
+            SNIFFLE_BAUD_RATES if (vid == 0x10C4 and pid in CP2102_PIDS) else (2_000_000,)
+        )
         found.append(
             DetectedSniffer(
                 port=port.device,
                 description=f"{name} on {port.device}",
                 vid=vid,
                 pid=pid,
-                baudrate=baud,
+                baudrate=candidates[0],
+                baud_candidates=candidates,
             )
         )
     return found
@@ -154,6 +178,9 @@ class FirmwareProbe(NamedTuple):
 
     version: str | None = None
     unreachable: str = ""
+    #: The UART rate that produced this answer. Set when ``version`` is, so a
+    #: caller that had to search for the rate can go on to use it.
+    baudrate: int | None = None
 
 
 def probe_firmware(
@@ -200,7 +227,7 @@ def probe_firmware(
                 version = (
                     data[3:].decode("utf-8", errors="replace").strip("\x00").strip()
                 )
-                return FirmwareProbe(version=version or "present")
+                return FirmwareProbe(version=version or "present", baudrate=baudrate)
         return FirmwareProbe()
     except Exception as exc:  # noqa: BLE001 — every failure here is "could not ask"
         return FirmwareProbe(unreachable=str(exc) or type(exc).__name__)
@@ -208,6 +235,39 @@ def probe_firmware(
         if ser is not None:
             with contextlib.suppress(Exception):
                 ser.close()
+
+
+def probe_firmware_any(
+    port: str,
+    baudrates: tuple[int, ...] = SNIFFLE_BAUD_RATES,
+    timeout: float = 0.4,
+) -> FirmwareProbe:
+    """Ask a dongle for its version at each candidate rate; return the first hit.
+
+    A wrong baud rate and absent firmware are indistinguishable from one query:
+    both are silence. Trying every rate Sniffle ships a build for is what keeps
+    "you have not flashed this yet" an honest statement rather than a guess.
+
+    Precedence in the reply: a version wins; failing that, a genuine silence
+    (the port opened, nothing came back) outranks unreachability, because
+    "opened it at 2 Mbaud, opened it at 921600, neither answered" really is
+    evidence about the firmware. Only if no rate could be opened at all do we
+    report unreachable, carrying the first reason — the port being busy or
+    unpermitted says nothing about what is flashed on it.
+    """
+    first_unreachable = ""
+    opened_any = False
+    for baud in baudrates:
+        probe = probe_firmware(port, baud, timeout)
+        if probe.version:
+            return probe
+        if probe.unreachable:
+            first_unreachable = first_unreachable or probe.unreachable
+        else:
+            opened_any = True
+    if opened_any:
+        return FirmwareProbe()
+    return FirmwareProbe(unreachable=first_unreachable or "could not open the port")
 
 
 class SniffleTransport:
@@ -359,6 +419,21 @@ class SniffleBackend(QueueBackend):
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _negotiate_baudrate(self, candidates: tuple[int, ...]) -> int:
+        """Find the rate this dongle actually talks at, before opening it properly.
+
+        Only reached when the caller did not pass one explicitly. If nothing
+        answers we fall back to the fastest candidate rather than refusing to
+        start: the dongle may simply be mid-reset, and failing here would deny
+        a working capture on the strength of one 0.4s query.
+        """
+        assert self.port is not None
+        probe = probe_firmware_any(self.port, candidates)
+        if probe.version and probe.baudrate:
+            self._firmware = probe.version
+            return probe.baudrate
+        return candidates[0]
+
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
 
@@ -376,11 +451,13 @@ class SniffleBackend(QueueBackend):
                 )
             chosen = found[0]
             self.port = chosen.port
-            self.baudrate = self.baudrate or chosen.baudrate
             self._hardware = chosen.description
+            if self.baudrate is None:
+                self.baudrate = self._negotiate_baudrate(chosen.baud_candidates)
         else:
-            self.baudrate = self.baudrate or 2_000_000
             self._hardware = f"serial port {self.port}"
+            if self.baudrate is None:
+                self.baudrate = self._negotiate_baudrate(SNIFFLE_BAUD_RATES)
 
         self._transport = SniffleTransport(self.port, self.baudrate)
         self._configure()

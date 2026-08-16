@@ -56,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--device", type=int, default=0, help="HCI adapter index (Linux)")
         p.add_argument("--port", dest="serial_port", help="serial port for a sniffer")
         p.add_argument(
+            "--baud",
+            dest="serial_baud",
+            type=int,
+            help="sniffer UART rate; default is to detect it (2000000, or 921600 "
+            "for Sniffle's _1M builds)",
+        )
+        p.add_argument(
             "--hci-mode",
             choices=("user", "monitor"),
             default="user",
@@ -181,6 +188,10 @@ def make_backend(args: argparse.Namespace):
     }
     if getattr(args, "session_id", None) is not None:
         kwargs["session_id"] = args.session_id
+    # Only when actually given: the nRF backend carries its own 1 Mbaud default,
+    # and passing None unconditionally would overwrite it with nothing.
+    if getattr(args, "serial_baud", None) is not None:
+        kwargs["baudrate"] = args.serial_baud
     name = getattr(args, "backend", None)
     if name:
         return create(name, **kwargs)
